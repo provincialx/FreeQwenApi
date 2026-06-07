@@ -204,6 +204,24 @@ function saveModelDefaultChat(model, chatId, parentId) {
   logDebug(`Default чат для ${model}: ${chatId}`);
 }
 
+function invalidateModelDefaultChat(model) {
+  const removed = modelDefaultChats.delete(model);
+  if (removed) {
+    logInfo(`🗑 Инвалидирован default-чат для ${model}: ${removed.chatId}`);
+  }
+  for (const [key, val] of chatIdMap.entries()) {
+    if (val === removed?.chatId) {
+      chatIdMap.delete(key);
+      logDebug(`Очищен маппинг: ${key} -> (удалён)`);
+    }
+  }
+}
+
+function isChatNotExistError(result) {
+  const body = result?.details || "";
+  return typeof body === "string" && /not exist/i.test(body);
+}
+
 // Глобальное хранилище для маппинга между сгенерированными ID и реальными Qwen chatId
 const chatIdMap = new Map();
 

@@ -909,7 +909,21 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             return response.data;
         }
 
-        return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
+        const apiResult = await handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
+
+        // Qwen удалил старый чат — попробуй ещё раз с новым.
+        if (retryCount === 0 && response.errorBody && /not exist/i.test(response.errorBody)) {
+            logWarn(`Qwen чат ${chatId} больше не существует. Создаю новый и повторяю запрос...`);
+            const newChatResult = await createChatV2(model, 'Сессия', 0, chatType);
+            if (newChatResult && newChatResult.chatId) {
+                return sendMessage(
+                    message, model, newChatResult.chatId, parentId, files,
+                    tools, toolChoice, systemMessage, chatType, size,
+                    waitForCompletion, retryCount + 1, onChunk
+                );
+            }
+        }
+        return apiResult;
     } catch (error) {
         logError('Ошибка при отправке сообщения', error);
         return { error: error.toString(), chatId };
