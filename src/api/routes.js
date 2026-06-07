@@ -50,6 +50,51 @@ import {
 } from "./tokenManager.js";
 import { FORGETMEAI_WATERMARK } from "../utils/branding.js";
 
+// ─── Idempotency / Dedup Cache ────────────────────────────────────────────────
+const idempotencyCache = new Map();
+const IDEM_CACHE_TTL_MS = 5000;
+
+function getIdempotencyKey(messages, chatId) {
+	if (!Array.isArray(messages) || messages.length === 0) return null;
+	const lastUser = [...messages].reverse().find((m) => m.role === "user");
+	if (!lastUser) return null;
+	let contentStr = "";
+	if (typeof lastUser.content === "string") {
+		contentStr = lastUser.content.substring(0, 200);
+	} else if (Array.isArray(lastUser.content)) {
+		const texts = lastUser.content.filter((x) => x.type === "text").map((x) => x.text || "");
+		contentStr = texts.join("").substring(0, 200);
+	}
+	if (!contentStr) return null;
+	const contentHash = crypto.createHash("md5").update(contentStr).digest("hex");
+	return `idemp::${chatId || "none"}::${contentHash}`;
+}
+
+function getCachedResult(key) {
+	if (!key) return null;
+	const entry = idempotencyCache.get(key);
+	if (!entry) return null;
+	if (Date.now() - entry.timestamp > IDEM_CACHE_TTL_MS) {
+		idempotencyCache.delete(key);
+		return null;
+	}
+	logInfo(`⚡️ Idempotency hit: returning cached result`);
+	return entry.result;
+}
+
+function cacheResult(key, result) {
+	if (!key || !result) return;
+	idempotencyCache.set(key, { result, timestamp: Date.now() });
+	if (idempotencyCache.size > 1000) {
+		const now = Date.now();
+		for (const [k, v] of idempotencyCache) {
+			if (now - v.timestamp > IDEM_CACHE_TTL_MS) idempotencyCache.delete(k);
+		}
+	}
+}
+
+
+
 // Функция для генерирования детерминированного chatId на основе истории
 function generateChatIdFromHistory(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -940,6 +985,9 @@ router.post("/chat", async (req, res) => {
           streamingCallback,
         );
 
+        // Cache successful result for idempotency dedup
+        if (!result.error) cacheResult(idemKey, result);
+
         if (result.error) {
           writeSse({
             id: "chatcmpl-" + Date.now(),
@@ -1430,6 +1478,20 @@ router.post("/chat/completions", async (req, res) => {
             ],
           });
           logDebug("Thinking placeholder sent (tool-capture mode)");
+        }
+
+        // Idempotency check: prevent Qwen from receiving duplicate tool calls/messages when Zed retries
+        const idemKey = getIdempotencyKey(messages, effectiveChatId);
+        const cachedResult = getCachedResult(idemKey);
+        if (cachedResult) {
+          logInfo(`⚡️ Returning deduplicated response for streaming request`);
+          writeSse({ id: "chatcmpl-stream", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: mappedModel || "qwen-max-latest", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+          const cachedContent = cachedResult.choices?.[0]?.message?.content;
+          if (cachedContent) writeSse({ id: "chatcmpl-stream", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: mappedModel || "qwen-max-latest", choices: [{ index: 0, delta: { content: cachedContent }, finish_reason: null }] });
+          writeSse({ id: "chatcmpl-stream", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: mappedModel || "qwen-max-latest", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+          res.write("data: [DONE]\\n\\n");
+          res.end();
+          return;
         }
 
         const result = await sendMessage(

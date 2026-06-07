@@ -63,7 +63,7 @@ export function toolsToPrompt(tools) {
         name: fn.name,
         description: truncateForPrompt(
           fn.description || "",
-          priorityNames.has(fn.name) ? 420 : 180,
+          priorityNames.has(fn.name) ? 300 : 150,
         ),
         parameters: compactJsonSchema(
           fn.parameters || { type: "object", properties: {} },
@@ -77,52 +77,24 @@ export function toolsToPrompt(tools) {
   if (schemas.length === 0) return "";
 
   const toolNames = schemas.map((s) => s.name).join(", ");
+
+  // Skill view specific injection only if present
   const skillRules = schemas.some((s) => s.name === "skill_view")
-    ? `
-SKILL RULES ARE HARD REQUIREMENTS:
-- If the system prompt says a skill MUST be loaded, you MUST call skill_view before answering.
-- If the user asks about Hermes Agent setup/config/providers/models/tools/skills/gateway/plugins/troubleshooting, FIRST call:
-  {"tool_calls":[{"name":"skill_view","arguments":{"name":"hermes-agent"}}]}
-- If a task is related to any listed skill category, call skill_view with the most relevant skill name before giving the final answer.
-- After receiving a skill_view result, use it, then continue normally or call the next needed tool.
-`
+    ? `\nCRITICAL: If user asks about skills/config/setup, ALWAYS call skill_view first. Then answer.`
     : "";
 
   return `
+INSTRUCTIONS:
+To perform actions (file read/write, commands, search), you MUST output tool calls in JSON format at the VERY END of your response.
 
+FORMAT (minified, last line only, NO markdown fences):
+{"tool_calls": [{"name": "<tool_name>", "arguments": {}}]}
 
-OPENAI-COMPATIBLE TOOL CALLING ADAPTER ACTIVE.
-You are behind a proxy that converts your JSON into real OpenAI tool_calls. Native prose like "I will use X" is NOT a tool call.
-
-Available tool names exactly:
-${toolNames}
-
-${skillRules}GENERAL TOOL RULES:
-- When an action, lookup, file read/write, command, web search, calculation, or verification is needed, CALL A TOOL instead of describing the action.
-- If the user asks you to do something, and a suitable tool exists, respond with a tool call first.
-- Never invent tool results. After tool results appear in the conversation, use them to continue.
-- Use exact tool names from the list above. Do not prefix names with namespaces.
-
-TOOL CALL OUTPUT FORMAT:
-1. First write a brief sentence explaining what you are doing (e.g. "I will create test.py").
-2. Then on a NEW LINE output minified JSON as your last line, no markdown:
-{"tool_calls":[{"name":"tool_name","arguments":{}}]}
-
-The proxy extracts the LAST JSON line as tool call. All text before it becomes visible assistant content.
-
-Multiple calls are allowed:
-{"tool_calls":[{"name":"skill_view","arguments":{"name":"hermes-agent"}},{"name":"terminal","arguments":{"command":"pwd"}}]}
-
-Supported fallback shapes also work, but the format above is preferred.
-
-Compact tool schemas:
-${JSON.stringify(
-  schemas.map(({ priority, ...schema }) => schema),
-  null,
-  2,
-)}
-
-If no tool is needed and no skill rule applies, answer normally.`;
+ALLOWED TOOLS: ${toolNames}
+${skillRules}
+DO NOT invent tool names. DO NOT use prose like "I will run..." to simulate action.
+If no action needed, answer normally in text.
+`;
 }
 
 export const lastRawContentForDebug = { value: null };
