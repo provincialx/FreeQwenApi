@@ -1286,7 +1286,7 @@ export async function sendMessage(
               .sort((a, b) => a.index - b.index),
           };
           response.data.choices[0].finish_reason = "tool_calls";
-
+        }
       }
 
       return response.data;
