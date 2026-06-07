@@ -22,7 +22,7 @@ import {
   parseToolCallJson,
   applyToolPrompt,
 } from "./toolUtils.js";
-import { logInfo, logError, logDebug } from "../logger/index.js";
+import { logInfo, logError, logWarn, logDebug } from "../logger/index.js";
 import { getMappedModel } from "./modelMapping.js";
 import { getStsToken, uploadFileToQwen } from "./fileUpload.js";
 import { loadHistory, saveHistory } from "./chatHistory.js";
