@@ -516,10 +516,12 @@ function buildPayloadV2(
       `System message: ${systemMessage.substring(0, 100)}${systemMessage.length > 100 ? "..." : ""}`,
     );
   }
-  // Qwen Chat web API does not support OpenAI native tool schemas.
-  // We emulate it by injecting instructions directly into the system message.
+  // Tool prompt already injected in routes.js via applyToolPrompt before calling sendMessage.
+  // Do NOT double-inject here — payload.system_message set above is final.
   if (tools && Array.isArray(tools) && tools.length > 0) {
-    systemMessage = applyToolPrompt(systemMessage, tools);
+    logDebug(
+      `Tools passed to buildPayloadV2: ${tools.length} (already injected in system message)`,
+    );
   }
 
   return payload;

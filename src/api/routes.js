@@ -1417,6 +1417,20 @@ router.post("/chat/completions", async (req, res) => {
           };
         }
 
+        // Keep Zed alive during tool-capture wait — send thinking placeholder so client doesn't timeout
+        if (stream && captureToolCalls) {
+          writeSse({
+            id: "chatcmpl-stream",
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: mappedModel || "qwen-max-latest",
+            choices: [
+              { index: 0, delta: { role: "assistant" }, finish_reason: null },
+            ],
+          });
+          logDebug("Thinking placeholder sent (tool-capture mode)");
+        }
+
         const result = await sendMessage(
           messageContent,
           mappedModel,
