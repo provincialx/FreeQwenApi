@@ -706,7 +706,11 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
 
 async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null) {
     logRaw(JSON.stringify(response));
-    logError(`Ошибка при получении ответа: ${response.error || response.statusText}`);
+    const errMsg = response.error || response.statusText || (response.status ? `HTTP ${response.status}` : 'Неизвестная ошибка');
+    if (!response.error && !response.statusText) {
+        logWarn(`handleApiError получил неполный объект: ключи=${Object.keys(response).join(',')}`);
+    }
+    logError(`Ошибка при получении ответа: ${errMsg}`);
     if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
 
     if (response.html && response.html.includes('Verification')) {
@@ -758,7 +762,8 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
     }
 
-    return { error: response.error || response.statusText, details: response.errorBody || 'Нет дополнительных деталей', chatId };
+    const finalError = response.error || response.statusText || (response.status ? `HTTP ${response.status}` : 'Неизвестная ошибка');
+    return { error: finalError, details: response.errorBody || 'Нет дополнительных деталей', chatId };
 }
 
 // ─── Main public API ─────────────────────────────────────────────────────────
