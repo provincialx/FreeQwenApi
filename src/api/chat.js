@@ -1286,11 +1286,7 @@ export async function sendMessage(
               .sort((a, b) => a.index - b.index),
           };
           response.data.choices[0].finish_reason = "tool_calls";
-        } else if (tools?.length > 0 && size !== "mini") {
-          logWarn(
-            `Модель не использовала инструменты. Предоставлено: ${tools.length}. Ответ (${size}): ${content.substring(0, 120)}...`,
-          );
-        }
+
       }
 
       return response.data;

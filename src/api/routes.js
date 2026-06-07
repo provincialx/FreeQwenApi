@@ -1475,6 +1475,20 @@ router.post("/chat/completions", async (req, res) => {
           }
         }
 
+        // Warn: модель получила инструменты но не использовала
+        if (
+          Array.isArray(combinedTools) &&
+          combinedTools.length > 0 &&
+          !result.error &&
+          result.choices?.[0]?.message &&
+          !result.choices[0].message.tool_calls &&
+          result.choices[0].message.content
+        ) {
+          logWarn(
+            `Модель не использовала инструменты. Предоставлено: ${combinedTools.length}. Ответ: ${String(result.choices[0].message.content).substring(0, 120)}...`,
+          );
+        }
+
         if (result.error) {
           writeSse({
             id: "chatcmpl-stream",
