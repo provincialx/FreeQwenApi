@@ -711,7 +711,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         logWarn(`handleApiError получил неполный объект: ключи=${Object.keys(response).join(',')}`);
     }
     logError(`Ошибка при получении ответа: ${errMsg}`);
-    if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
+    if (response.errorBody) logWarn(`Ошибка API ответ: ${response.errorBody.substring(0, 500)}`);
 
     if (response.html && response.html.includes('Verification')) {
         setAuthenticationStatus(false);
