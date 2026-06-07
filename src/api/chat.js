@@ -1311,6 +1311,21 @@ export async function sendMessage(
           return retryResult;
         }
       }
+
+      // Handle Qwen API error: "The chat is in progress!" -> create new chat and retry once
+      if (response.errorBody && /chat is in progress/i.test(response.errorBody)) {
+        logWarn(`Qwen чат ${chatId} заблокирован ("in progress"). Создаю новый и повторяю запрос...`);
+        const newChatResult = await createChatV2(model, "Сессия", 0, chatType);
+        if (newChatResult && newChatResult.chatId) {
+          const retryResult = await sendMessage(
+            message, model, newChatResult.chatId, parentId, files, tools, toolChoice,
+            systemMessage, chatType, size, waitForCompletion, 1, onChunk,
+          );
+          if (!retryResult.error) retryResult.newChatId = newChatResult.chatId;
+          return retryResult;
+        }
+      }
+
       return apiResult;
     }
   } catch (error) {
