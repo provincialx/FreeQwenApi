@@ -2,3 +2,125 @@ NEVER modify, compress, or rewrite this file. This is sacred. Hands off.
 
 Read full documents at the entrance .md and update any changes.
 Commit any changes and push to the repository.
+
+# FreeQwenApi — Rules for AI Assistant
+
+## 1. Project Context
+- **FreeQwenApi** = браузерный прокси ForgetMeAI. Node.js + Puppeteer.
+- Заменяет веб-аккаунт Qwen Chat на локальный OpenAI-compatible API (`localhost:3264`).
+- Эмулирует вызовы Qwen через JS `fetch` внутри puppeteer-страницы.
+- Целевой клиент — Zed Agent (Browser), но поддерживает любой OpenAI-compatible клиент.
+- **Терминальные обёртки (Aider и т.д.) исключены** — цель: полноценный agent с tool_calls через интерфейс Zed.
+
+## 2. Architecture & Stack
+- **Runtime**: Node.js (ES Modules), Express.
+- **Browser**: Puppeteer с Chromium. CDP-протокол.
+- **Key Config**: `protocolTimeout: 600_000` (10 мин) в `browser.js` — дефолт 180с убивает длинные задачи.
+- **Page Pool**: `pagePool.getPage()` с health-check. Все `page.evaluate()` **обязаны** использовать `evaluateWithTimeout()` (Promise.race, 5с) — иначе CDP-зависание блокирует пул навсегда.
+- **Retry Policy**: `goto(CHAT_PAGE_URL)` — до 3 попыток с exponential backoff. Сетевые ошибки (`ERR_CONNECTION_RESET`) не должны фейлить мгновенно.
+
+## 3. Critical Code Rules
+
+### 3.1 Tool Calls (Самое важное)
+- **Qwen Chat web API не принимает OpenAI `tools[]`**. Никогда не передавать нативный `tools` в `sendMessage()`.
+- **Единственный правильный путь**: инжектировать инструменты в System Message через `applyToolPrompt()` из `src/api/toolUtils.js`.
+- **Парсинг ответа**: ответ Qwen приходит как JSON-текст. Парсить через `parseToolCallJson()` из `toolUtils.js` обратно в OpenAI `message.tool_calls`.
+- **Не дублировать** логику tool prompt / parse между файлами — вся логика централизована в `toolUtils.js`.
+- При streaming с tool calls: `captureToolCalls = true` отключает обычный streaming callback, ответ собирается целиком для парсинга.
+
+### 3.2 Sliding Window & History
+- При `messages.length > 60` — срез до System Prompt + последние 40 сообщений.
+- **Обязательное условие**: если после `.slice(-40)` первое сообщение имеет `role: "tool"`, **добавить предшествующий `assistant` с `tool_calls`** в начало среза. Иначе Qwen теряет контекст вызова и ломается agent-loop.
+- Логирование истории: вместо бесконечной строки ролей использовать сводку: `273 сообщений (1x system, 85x user, 86x assistant, 101x tool)`.
+
+### 3.3 Chat ID Resolution (Layered Fallback)
+Порядок разрешения `effectiveChatId` → `qwenChatId` (функция `resolveQwenChatId`):
+1. `chatIdMap` (глобальный маппинг generated→qwen)
+2. `modelDefaultChats` (один чат на модель для агентов без conversation_id)
+3. Создание нового чата через `createChatV2()` + сохранение в маппинг и default
+- **Функция `resolveQwenChatId` всегда должна возвращать `qwenChatId`** (раньше был баг с отсутствием `return`).
+- При `forceNewChat` — генерировать новый `chat_` ID, сбрасывать `parentId`.
+- При ошибке `"chat_not_exist"` от Qwen: инвалидировать `modelDefaultChats` и `chatIdMap`, создать свежий чат, повторить запрос **ровно один раз** (`retryCount === 0`).
+
+### 3.4 Session Management
+- **Scoped sessions**: по `conversation_id`/`chat_id` (из хедеров или body). Ключ: `sha256(ip||ua)::conversation:${hint}`.
+- **Unscoped fallback**: по IP+UA только если `ALLOW_UNSCOPED_SESSION_CHAT_RESTORE=true`.
+- **Meta-запросы OpenWebUI** (`### Task:`, `History:`) — всегда `effectiveChatId = null`, `effectiveParentId = null`, чтобы не засорять основной чат.
+- `isOpenWebUiMetaRequest()` — фильтрует фоновые промпты OpenWebUI.
+
+### 3.5 Error Handling
+- `handleApiError()` в `chat.js` **всегда возвращает строку** (`HTTP 500`, `Неизвестная ошибка` и т.д.). Никогда `{ error: undefined }`.
+- Логирование тела ответа API — уровень `WARN` (не DEBUG).
+- `isChatNotExistError()` — проверяет `/not exist/i` в `result.details`.
+
+### 3.6 Message Folding (OpenAI/Hermes Compatibility)
+- Если `hasOpenAIToolState(messages)` или `!effectiveChatId && nonSystemMessages.length > 1` — сворачивать всю историю в одно user-сообщение через `buildStatelessTranscript()`.
+- Qwen Chat не имеет роли `tool`, поэтому tool results передаются только через folded transcript или prompt injection.
+
+### 3.7 Streaming
+- SSE headers: `text/event-stream`, `X-Accel-Buffering: no`, `Transfer-Encoding: chunked`.
+- Qwen может вернуть JSON вместо SSE — в этом случае отправить контент одним чанком.
+- Chunk size: 16 code points (не байт — Unicode safety).
+- `STREAMING_CHUNK_DELAY` между чанками.
+
+## 4. File Responsibilities
+- `src/api/routes.js` — OpenAI-compatible endpoints (`/chat/completions`, `/v1/chat/completions`), sliding window, routing.
+- `src/api/chat.js` — отправка сообщений в Qwen через Puppeteer, retry-логика, error handling, `evaluateWithTimeout`.
+- `src/api/toolUtils.js` — **единственное** место для `applyToolPrompt`, `parseToolCallJson`, `toolsToPrompt`, `truncateForPrompt`, `compactJsonSchema`.
+- `src/browser/browser.js` — инициализация Puppeteer, `protocolTimeout`, page pool.
+- `src/browser/auth.js` — проверка аутентификации Qwen.
+- `src/api/tokenManager.js` — ротация аккаунтов, статусы (OK, RATELIMIT, INVALID).
+- `src/api/chatHistory.js` — локальное хранение истории (JSON).
+- `src/config.js` — константы: `MAX_FILE_SIZE`, `UPLOADS_DIR`, `DEFAULT_MODEL`, `STREAMING_CHUNK_DELAY`, `ALLOW_UNSCOPED_SESSION_CHAT_RESTORE`.
+
+## 5. Logging Standards
+- Использовать только `logInfo()`, `logError()`, `logDebug()` из `src/logger/index.js`.
+- Никаких `console.log`/`console.error` в production коде.
+- Формат логов: эмодзи-префикс для быстрой идентификации (`🔁`, `♻️`, `🔨`, `🗑`).
+
+## 6. Testing Checklist (Smoke Test)
+При любом изменении в core-логике проверить:
+1. **Sliding window** (65+ msg) → корректный ответ, tool_call пары сохранены.
+2. **Tool call roundtrip** → agent-loop path работает (prompt injection → JSON ответ → parseToolCallJson).
+3. **Streaming endpoint** → `text/event-stream`, первый чанк получен, финальный `[DONE]`.
+4. **Chat not exist retry** → при удалении чата на стороне Qwen прокси создаёт новый и продолжает.
+5. **Meta-request isolation** → OpenWebUI background prompts не ломают основную сессию.
+
+## 7. Tech Debt & Known Issues (Do Not Introduce New Debt)
+- `removeInvalidToken` imported but unused в `chat.js` — не добавлять новые unused imports.
+- Node-streaming использует глобальный `fetch`. На старых Node может отсутствовать. Fallback к browser fetch уже есть, но явная проверка `typeof fetch` предпочтительнее.
+- Память браузера растёт при длительном agent-loop (>100 вызовов). Нет hard limit на размер пула + автоматический перезапуск Chromium. PAGE_POOL_SIZE=3 помогает, но старые страницы не GC-нуты пока в массиве. При добавлении max-age на страницы — учитывать это ограничение.
+- `testToken` импортирован в `routes.js` — используется только в `/status`. Не размножать token-test логику вне `tokenManager.js`.
+
+## 8. Prohibited Patterns
+- ❌ Передавать `tools[]` в нативном OpenAI формате в `sendMessage()` — Qwen web API их не понимает.
+- ❌ Дублировать логику `applyToolPrompt` / `parseToolCallJson` вне `toolUtils.js`.
+- ❌ Использовать `page.evaluate()` без таймаута — всегда через `evaluateWithTimeout()`.
+- ❌ Возвращать `undefined` из `handleApiError()` или `resolveQwenChatId()`.
+- ❌ Рвать tool_call/tool_result пары в sliding window.
+- ❌ Использовать `console.log` вместо логгера.
+- ❌ Делать `goto()` без retry-loop при сетевых операциях.
+
+## Caveman Mode
+Rules:
+- Drop: articles (a/an/the), filler (just/really/basically), pleasantries, hedging
+- Fragments OK. Short synonyms. Technical terms exact. Code unchanged.
+- Pattern: [thing] [action] [reason]. [next step].
+- Not: "Sure! I'd be happy to help you with that."
+- Yes: "Bug in auth middleware. Fix:"
+
+Switch level: /caveman lite|full|ultra|wenyan
+Stop: "stop caveman" or "normal mode"
+
+Auto-Clarity: drop caveman for security warnings, irreversible actions, user confused. Resume after.
+
+Boundaries: code/commits/PRs written normal.
+
+## Language
+- User-facing strings: **Russian**.
+- Comments: match file convention (English or Russian, keep consistent within file).
+
+## MemPalace
+You have access to MemPalace MCP server with 30 tools for long-term memory.
+Always search MemPalace when user asks about past decisions, previous code, or project history.
+Trigger words: remember, previously, last time, we decided, why did we.
