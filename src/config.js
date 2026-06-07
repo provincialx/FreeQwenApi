@@ -68,6 +68,6 @@ export const ALLOW_UNSCOPED_SESSION_CHAT_RESTORE = toBoolean(
 );
 
 // ─── Логирование ─────────────────────────────────────────────────────────────
-export const LOG_LEVEL = process.env.LOG_LEVEL || "debug";
+export const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 export const LOG_MAX_SIZE = Number(process.env.LOG_MAX_SIZE) || 5_242_880; // 5 MB
 export const LOG_MAX_FILES = Number(process.env.LOG_MAX_FILES) || 5;

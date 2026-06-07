@@ -4,7 +4,6 @@ import bodyParser from "body-parser";
 
 import { initBrowser, shutdownBrowser } from "./src/browser/browser.js";
 import apiRoutes from "./src/api/routes.js";
-import { requestTracer } from "./src/debug-trace.js";
 import { getAvailableModelsFromFile, getApiKeys } from "./src/api/chat.js";
 import { loadTokens } from "./src/api/tokenManager.js";
 import { addAccountInteractive } from "./src/utils/accountSetup.js";
@@ -92,8 +91,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Debug tracer — ловит каждый шаг /chat/completions, тайминги, ошибки
-app.use(requestTracer());
 app.use("/api", apiRoutes);
 
 app.use((req, res) => {

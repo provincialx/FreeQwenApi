@@ -14,13 +14,7 @@ import {
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import {
-  logInfo,
-  logError,
-  logWarn,
-  logDebug,
-  logRaw,
-} from "../logger/index.js";
+import { logInfo, logError, logWarn, logDebug } from "../logger/index.js";
 import crypto from "crypto";
 import { applyToolPrompt, parseToolCallJson } from "./toolUtils.js";
 import {
@@ -934,7 +928,6 @@ async function handleApiError(
   waitForCompletion,
   onChunk = null,
 ) {
-  logRaw(JSON.stringify(response));
   const errMsg =
     response.error ||
     response.statusText ||
@@ -1171,7 +1164,6 @@ export async function sendMessage(
 
     if (response.success && response.isTask) {
       logInfo("Обнаружен ответ с задачей (видеогенерация)");
-      logRaw(JSON.stringify(response.data));
 
       const taskId = extractTaskId(response.data);
       if (!taskId) {
@@ -1255,7 +1247,6 @@ export async function sendMessage(
     page = null;
 
     if (response.success) {
-      logRaw(JSON.stringify(response.data));
       logInfo("Ответ получен успешно");
       response.data.chatId = chatId;
       response.data.parentId = response.data.response_id;
