@@ -1456,13 +1456,22 @@ router.post("/chat/completions", async (req, res) => {
 
           // Обновляем дефолтный чат модели — следующий request без chatId reused его
           const existing = getOrCreateModelDefaultChat(mappedModel);
-          if (existing && existing.chatId === resolvedChatId) {
+          if (
+            (existing && existing.chatId === resolvedChatId) ||
+            result.newChatId
+          ) {
             saveModelDefaultChat(
               mappedModel,
               resolvedChatId,
               result.parentId || effectiveParentId,
             );
-            logDebug(`Обновлён parentId в default-чате: ${result.parentId}`);
+            if (result.newChatId) {
+              logInfo(
+                `♻️ Обновлён default-чат после создания нового: ${resolvedChatId} для ${mappedModel}`,
+              );
+            } else {
+              logDebug(`Обновлён parentId в default-чате: ${result.parentId}`);
+            }
           }
         }
 
@@ -1568,13 +1577,22 @@ router.post("/chat/completions", async (req, res) => {
 
         // Обновляем дефолтный чат модели
         const existingDefault = getOrCreateModelDefaultChat(mappedModel);
-        if (existingDefault && existingDefault.chatId === resolvedChatId) {
+        if (
+          (existingDefault && existingDefault.chatId === resolvedChatId) ||
+          result.newChatId
+        ) {
           saveModelDefaultChat(
             mappedModel,
             resolvedChatId,
             result.parentId || effectiveParentId,
           );
-          logDebug(`Обновлён parentId в default-чате: ${result.parentId}`);
+          if (result.newChatId) {
+            logInfo(
+              `♻️ Обновлён default-чат после создания нового: ${resolvedChatId} для ${mappedModel}`,
+            );
+          } else {
+            logDebug(`Обновлён parentId в default-чате: ${result.parentId}`);
+          }
         }
       }
 
@@ -1888,13 +1906,22 @@ router.post("/v1/chat/completions", async (req, res) => {
 
           // Обновляем дефолтный чат модели
           const existingDefault = getOrCreateModelDefaultChat(mappedModel);
-          if (existingDefault && existingDefault.chatId === resolvedChatId) {
+          if (
+            (existingDefault && existingDefault.chatId === resolvedChatId) ||
+            result.newChatId
+          ) {
             saveModelDefaultChat(
               mappedModel,
               resolvedChatId,
               result.parentId || effectiveParentId,
             );
-            logDebug(`Обновлён parentId в default-чате: ${result.parentId}`);
+            if (result.newChatId) {
+              logInfo(
+                `♻️ Обновлён default-чат после создания нового: ${resolvedChatId} для ${mappedModel}`,
+              );
+            } else {
+              logDebug(`Обновлён parentId в default-чате: ${result.parentId}`);
+            }
           }
         }
 
@@ -2002,13 +2029,22 @@ router.post("/v1/chat/completions", async (req, res) => {
 
         // Обновляем дефолтный чат модели
         const existingDefault = getOrCreateModelDefaultChat(mappedModel);
-        if (existingDefault && existingDefault.chatId === resolvedChatId) {
+        if (
+          (existingDefault && existingDefault.chatId === resolvedChatId) ||
+          result.newChatId
+        ) {
           saveModelDefaultChat(
             mappedModel,
             resolvedChatId,
             result.parentId || effectiveParentId,
           );
-          logDebug(`Обновлён parentId в default-чате: ${result.parentId}`);
+          if (result.newChatId) {
+            logInfo(
+              `♻️ Обновлён default-чат после создания нового: ${resolvedChatId} для ${mappedModel}`,
+            );
+          } else {
+            logDebug(`Обновлён parentId в default-чате: ${result.parentId}`);
+          }
         }
       }
 

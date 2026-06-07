@@ -1270,78 +1270,85 @@ export async function sendMessage(
       }
 
       // Post-process: Qwen Chat returns tool calls as JSON text, not native API format.
-	  // Convert text-based JSON into OpenAI-style message.tool_calls for agent loop.
-	  const content = response.data.choices?.[0]?.message?.content;
-	  if (typeof content === "string") {
-	    const parsedCalls = parseToolCallJson(content);
-	    if (parsedCalls && parsedCalls.length > 0) {
-	      logInfo(
-	        `Инструменты найдены в ответе Qwen: ${parsedCalls.map((c) => c.function.name).join(", ")}`,
-	      );
-	      response.data.choices[0].message = {
-	        role: "assistant",
-	        content: null,
-	        tool_calls: parsedCalls
-	          .map(({ index, ...call }) => call)
-	          .sort((a, b) => a.index - b.index),
-		      response.data.choices[0].finish_reason = "tool_calls";
-		    }
-	  }
-
-    return response.data;
-  } else {
-    const apiResult = await handleApiError(
-      response,
-      tokenObj,
-      message,
-      model,
-      chatId,
-      parentId,
-      files,
-      retryCount,
-      chatType,
-      size,
-      waitForCompletion,
-      onChunk,
-    );
-
-    if (
-      retryCount === 0 &&
-      response.errorBody &&
-      /not exist/i.test(response.errorBody)
-    ) {
-      logWarn(
-        `Qwen чат ${chatId} больше не существует. Создаю новый и повторяю запрос...`,
-      );
-      const newChatResult = await createChatV2(model, "Сессия", 0, chatType);
-      if (newChatResult && newChatResult.chatId) {
-        return sendMessage(
-          message,
-          model,
-          newChatResult.chatId,
-          parentId,
-          files,
-          tools,
-          toolChoice,
-          systemMessage,
-          chatType,
-          size,
-          waitForCompletion,
-          retryCount + 1,
-          onChunk,
-        );
+      // Convert text-based JSON into OpenAI-style message.tool_calls for agent loop.
+      const content = response.data.choices?.[0]?.message?.content;
+      if (typeof content === "string" && content.trim().length > 0) {
+        const parsedCalls = parseToolCallJson(content);
+        if (parsedCalls && parsedCalls.length > 0) {
+          logInfo(
+            `Инструменты найдены в ответе Qwen: ${parsedCalls.map((c) => c.function.name).join(", ")}`,
+          );
+          response.data.choices[0].message = {
+            role: "assistant",
+            content: null,
+            tool_calls: parsedCalls
+              .map(({ index, ...call }) => call)
+              .sort((a, b) => a.index - b.index),
+          };
+          response.data.choices[0].finish_reason = "tool_calls";
+        } else if (tools?.length > 0 && size !== "mini") {
+          logWarn(
+            `Модель не использовала инструменты. Предоставлено: ${tools.length}. Ответ (${size}): ${content.substring(0, 120)}...`,
+          );
+        }
       }
+
+      return response.data;
+    } else {
+      const apiResult = await handleApiError(
+        response,
+        tokenObj,
+        message,
+        model,
+        chatId,
+        parentId,
+        files,
+        retryCount,
+        chatType,
+        size,
+        waitForCompletion,
+        onChunk,
+      );
+
+      if (response.errorBody && /not exist/i.test(response.errorBody)) {
+        logWarn(
+          `Qwen чат ${chatId} больше не существует. Создаю новый и повторяю запрос...`,
+        );
+        const newChatResult = await createChatV2(model, "Сессия", 0, chatType);
+        if (newChatResult && newChatResult.chatId) {
+          // Retry with new chat. Mark result so routes knows to update default cache.
+          const retryResult = await sendMessage(
+            message,
+            model,
+            newChatResult.chatId,
+            parentId,
+            files,
+            tools,
+            toolChoice,
+            systemMessage,
+            chatType,
+            size,
+            waitForCompletion,
+            1, // prevent infinite retry loop
+            onChunk,
+          );
+          // Signal to routes: this request used a newly-created chat
+          if (!retryResult.error) {
+            retryResult.newChatId = newChatResult.chatId;
+          }
+          return retryResult;
+        }
+      }
+      return apiResult;
     }
-    return apiResult;
+  } catch (error) {
+    logError("Ошибка при отправке сообщения", error);
+    return { error: error.toString(), chatId };
+  } finally {
+    if (page) {
+      pagePool.releasePage(page);
+    }
   }
-} catch (error) {
-  logError("Ошибка при отправке сообщения", error);
-  return { error: error.toString(), chatId };
-} finally {
-  if (page) {
-    pagePool.releasePage(page);
-  }
-}
 }
 
 // ─── Task response helpers
