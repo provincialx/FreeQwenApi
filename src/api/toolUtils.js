@@ -103,8 +103,12 @@ ${skillRules}GENERAL TOOL RULES:
 - Never invent tool results. After tool results appear in the conversation, use them to continue.
 - Use exact tool names from the list above. Do not prefix names with namespaces.
 
-TOOL CALL OUTPUT FORMAT — respond ONLY with minified JSON, no markdown, no prose:
+TOOL CALL OUTPUT FORMAT:
+1. First write a brief sentence explaining what you are doing (e.g. "I will create test.py").
+2. Then on a NEW LINE output minified JSON as your last line, no markdown:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
+
+The proxy extracts the LAST JSON line as tool call. All text before it becomes visible assistant content.
 
 Multiple calls are allowed:
 {"tool_calls":[{"name":"skill_view","arguments":{"name":"hermes-agent"}},{"name":"terminal","arguments":{"command":"pwd"}}]}
@@ -126,11 +130,15 @@ export function parseToolCallJson(content) {
   let text = content.trim();
   const fence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   if (fence) text = fence[1].trim();
-  const first = text.indexOf("{");
-  const last = text.lastIndexOf("}");
-  if (first > 0 || last !== text.length - 1) {
-    if (first >= 0 && last > first) text = text.slice(first, last + 1);
+
+  // Model now outputs reasoning text BEFORE JSON on last line.
+  // Extract last JSON object: find { ... } starting from end of string.
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    text = text.slice(firstBrace, lastBrace + 1);
   }
+
   const parseAttempts = [text];
   // Qwen sometimes emits one missing brace in the common shape:
   // {"tool_calls":[{"name":"x","arguments":{...}}]} -> may become ..."arguments":{...}]}
