@@ -1260,6 +1260,9 @@ export async function sendMessage(
         response.data.choices?.[0]?.message?.content
       ) {
         onChunk(response.data.choices[0].message.content);
+      } else {
+        const dbgContent = response.data.choices?.[0]?.message?.content;
+        logInfo("CAPTURE MODE: content type=" + typeof(dbgContent) + ", len=" + (dbgContent?.length ?? 0) + ", preview=" + JSON.stringify(dbgContent).substring(0,200));
       }
 
       return response.data;
