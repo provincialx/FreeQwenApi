@@ -1017,12 +1017,21 @@ router.post("/chat", async (req, res) => {
     let allMessages = messages; // Сохраняем всю историю
     const isMeta = isOpenWebUiMetaRequest(messages);
 
-        // Sliding Window: cut massive agent-loops to ~40 last steps + system prompt to save context from crashing Qwen API
+    // Sliding Window: cut massive agent-loops to ~40 last steps + system prompt.
+    // Safely preserve tool_call/tool_result pairs: if slice starts mid-sequence,
+    // include the preceding assistant message with tool_calls so Qwen sees context.
     if (messages.length > 60) {
-        const sysMsgs = messages.filter(m => m.role === 'system');
-        const nonSys = messages.filter(m => m.role !== 'system').slice(-40);
-        // @ts-ignore - we modify the array to fit browser API limits
-        messages = [...sysMsgs, ...nonSys];
+      const sysMsgs = messages.filter((m) => m.role === "system");
+      let nonSys = messages.filter((m) => m.role !== "system").slice(-40);
+      // If the first kept message is a tool result, prepend its assistant caller.
+      if (nonSys[0]?.role === "tool" && messages.length > sysMsgs.length + 1) {
+        const allNonSys = messages.filter((m) => m.role !== "system");
+        const startIndex = allNonSys.indexOf(nonSys[0]);
+        if (startIndex > 0) {
+          nonSys = [allNonSys[startIndex - 1], ...nonSys];
+        }
+      }
+      messages = [...sysMsgs, ...nonSys];
     }
 
     if (messages && Array.isArray(messages)) {
@@ -1526,8 +1535,15 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     // Сворачиваем историю, чтобы не превращать консоль в "потрошное месиво" при agent-loop (tool_calls)
-    const roleCounts = {}; messages.forEach(m => { if (m?.role) roleCounts[m.role] = (roleCounts[m.role] || 0) + 1; });
-    logInfo(`История: ${messages.length} сообщений (${Object.entries(roleCounts).map(([r,c]) => `${c}${c>1?'x':''} ${r}`).join(", ")})`);
+    const roleCounts = {};
+    messages.forEach((m) => {
+      if (m?.role) roleCounts[m.role] = (roleCounts[m.role] || 0) + 1;
+    });
+    logInfo(
+      `История: ${messages.length} сообщений (${Object.entries(roleCounts)
+        .map(([r, c]) => `${c}${c > 1 ? "x" : ""} ${r}`)
+        .join(", ")})`,
+    );
     if (effectiveChatId) {
       logInfo(
         `Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || "null"}`,
@@ -1960,8 +1976,15 @@ router.post("/v1/chat/completions", async (req, res) => {
     }
 
     // Сворачиваем историю, чтобы не превращать консоль в "потрошное месиво" при agent-loop (tool_calls)
-    const roleCounts = {}; messages.forEach(m => { if (m?.role) roleCounts[m.role] = (roleCounts[m.role] || 0) + 1; });
-    logInfo(`История: ${messages.length} сообщений (${Object.entries(roleCounts).map(([r,c]) => `${c}${c>1?'x':''} ${r}`).join(", ")})`);
+    const roleCounts = {};
+    messages.forEach((m) => {
+      if (m?.role) roleCounts[m.role] = (roleCounts[m.role] || 0) + 1;
+    });
+    logInfo(
+      `История: ${messages.length} сообщений (${Object.entries(roleCounts)
+        .map(([r, c]) => `${c}${c > 1 ? "x" : ""} ${r}`)
+        .join(", ")})`,
+    );
     if (effectiveChatId) {
       logInfo(
         `Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || "null"}`,

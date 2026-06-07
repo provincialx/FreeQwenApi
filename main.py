@@ -5,6 +5,7 @@ import uuid
 import asyncio
 import sys
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Union
 
@@ -33,6 +34,11 @@ SESSION_DIR = "session"
 TOKENS_FILE = os.path.join(SESSION_DIR, "tokens.json")
 DEFAULT_MODEL = "qwen-max-latest"
 AVAILABLE_MODELS_FILE = os.path.join("src", "AvailableModels.txt")
+
+# Глобальная переменная для переиспользования чата
+_last_chat_id: str | None = None
+_last_parent_id: str | None = None
+_chat_account_map: Dict[str, str] = {}  # chat_id → account_id
 
 # =================================================================
 # MODEL MAPPING (Embedded for standalone usage)
@@ -70,6 +76,12 @@ def load_available_models() -> List[str]:
 # =================================================================
 logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("FreeQwenApi")
+
+# Настройка файлового логирования с ротацией
+os.makedirs("logs", exist_ok=True)
+file_handler = RotatingFileHandler("logs/proxy.log", maxBytes=5_000_000, backupCount=3)
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.getLogger().addHandler(file_handler)
 
 # Глобальный HTTP-клиент для сохранения кук (сессии)
 http_client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
@@ -249,7 +261,10 @@ async def create_qwen_chat(token_obj, model=DEFAULT_MODEL):
                 return None
             try:
                 data = resp.json()
-                return data.get('data', {}).get('id')
+                chat_id = data.get('data', {}).get('id')
+                if chat_id:
+                    logger.info(f"NEW CHAT CREATED: {chat_id} (previous _last_chat_id was {_last_chat_id})")
+                return chat_id
             except Exception as je:
                 logger.error(f"Ошибка парсинга JSON: {je}. Тело: {resp.text[:500]}")
         else:
@@ -258,7 +273,7 @@ async def create_qwen_chat(token_obj, model=DEFAULT_MODEL):
         logger.error(f"Исключение при создании чата: {e}")
     return None
 
-def build_qwen_payload(message_content, model, chat_id, parent_id=None, system_message=None, files=None):
+def build_qwen_payload(message_content, model, chat_id, parent_id=None, system_message=None, files=None, tools=None):
     user_msg_id = str(uuid.uuid4())
     assistant_msg_id = str(uuid.uuid4())
     
@@ -277,7 +292,6 @@ def build_qwen_payload(message_content, model, chat_id, parent_id=None, system_m
         "files": files or [],
         "childrenIds": [assistant_msg_id],
         "extra": {"meta": {"subChatType": "t2t"}},
-        "feature_config": {"thinking_enabled": False, "output_schema": "phase"}
     }
     
     payload = {
@@ -295,6 +309,13 @@ def build_qwen_payload(message_content, model, chat_id, parent_id=None, system_m
     
     if system_message:
         payload["system_message"] = system_message
+        
+    if tools:
+        payload["tools"] = tools
+        payload["function_calling"] = True
+    else:
+        new_message["feature_config"] = {"thinking_enabled": False, "output_schema": "phase"}
+        
     return payload
 
 def _normalize_message_content(content):
@@ -342,7 +363,16 @@ def _extract_chat_ids(body: Dict[str, Any]):
     parent_id = body.get("parentId") or body.get("parent_id") or body.get("x_qwen_parent_id")
     return chat_id, parent_id
 
-def _build_openai_completion(content: str, model: str, chat_id: Optional[str], parent_id: Optional[str], usage: Optional[Dict[str, Any]] = None):
+def _build_openai_completion(content: str, model: str, chat_id: Optional[str], parent_id: Optional[str], usage: Optional[Dict[str, Any]] = None, tool_calls: Optional[List[Dict[str, Any]]] = None):
+    message = {"role": "assistant", "content": content}
+    finish_reason = "stop"
+    
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        finish_reason = "tool_calls"
+        if content == "" or content is None:
+            message["content"] = None
+
     return {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -350,8 +380,8 @@ def _build_openai_completion(content: str, model: str, chat_id: Optional[str], p
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop"
+            "message": message,
+            "finish_reason": finish_reason
         }],
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "chatId": chat_id,
@@ -451,7 +481,7 @@ async def execute_qwen_completion(token_obj, chat_id, payload, on_chunk=None):
                     content = str(parsed["data"].get("content") or "")
 
                 if content and callable(on_chunk):
-                    on_chunk(content)
+                    on_chunk({"type": "content", "data": content})
 
                 return {
                     "success": True,
@@ -464,6 +494,7 @@ async def execute_qwen_completion(token_obj, chat_id, payload, on_chunk=None):
             response_id = None
             usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             finished = False
+            accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
 
             async for raw_line in response.aiter_lines():
                 line = raw_line.strip()
@@ -502,23 +533,51 @@ async def execute_qwen_completion(token_obj, chat_id, payload, on_chunk=None):
 
                 first_choice = choices[0] if isinstance(choices[0], dict) else {}
                 delta = first_choice.get("delta") if isinstance(first_choice.get("delta"), dict) else {}
+                
+                # Логировать наличие tool_calls в каждом chunk
+                if delta.get("tool_calls"):
+                    logger.info(f"SSE chunk has tool_calls: {len(delta['tool_calls'])} calls")
+
                 piece = delta.get("content")
                 if piece is not None:
                     piece_str = str(piece)
                     full_content += piece_str
                     if callable(on_chunk):
-                        on_chunk(piece_str)
+                        on_chunk({"type": "content", "data": piece_str})
+
+                tool_calls_delta = delta.get("tool_calls")
+                if tool_calls_delta:
+                    # Отправляем инкрементальные обновления tool_calls в поток
+                    if callable(on_chunk):
+                        on_chunk({"type": "tool_calls", "data": tool_calls_delta})
+
+                    for tc in tool_calls_delta:
+                        idx = tc.get("index", 0)
+                        if idx not in accumulated_tool_calls:
+                            accumulated_tool_calls[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                        if tc.get("id"):
+                            accumulated_tool_calls[idx]["id"] = tc["id"]
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            accumulated_tool_calls[idx]["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
 
                 if delta.get("status") == "finished" or first_choice.get("finish_reason"):
                     finished = True
                     break
+
+            final_tool_calls = None
+            if accumulated_tool_calls:
+                final_tool_calls = [accumulated_tool_calls[k] for k in sorted(accumulated_tool_calls.keys())]
 
             return {
                 "success": True,
                 "content": full_content,
                 "response_id": response_id,
                 "usage": usage,
-                "finished": finished
+                "finished": finished,
+                "tool_calls": final_tool_calls
             }
 
     except Exception as e:
@@ -544,12 +603,17 @@ app.add_middleware(
 )
 
 async def _stream_openai_response(token_info, chat_id: str, payload: Dict[str, Any], model: str):
+    global _last_chat_id, _last_parent_id
     queue: asyncio.Queue = asyncio.Queue()
     has_streamed_chunks = False
 
-    def on_chunk(chunk_text: str):
-        if chunk_text:
-            queue.put_nowait(chunk_text)
+    def on_chunk(chunk_data: Union[str, Dict[str, Any]]):
+        if chunk_data:
+            # Защита от передачи строки вместо словаря (обратная совместимость)
+            if isinstance(chunk_data, str):
+                queue.put_nowait({"type": "content", "data": chunk_data})
+            else:
+                queue.put_nowait(chunk_data)
 
     task = asyncio.create_task(execute_qwen_completion(token_info, chat_id, payload, on_chunk=on_chunk))
 
@@ -558,20 +622,39 @@ async def _stream_openai_response(token_info, chat_id: str, payload: Dict[str, A
             if task.done() and queue.empty():
                 break
             try:
-                chunk = await asyncio.wait_for(queue.get(), timeout=0.2)
+                item = await asyncio.wait_for(queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
                 continue
 
             has_streamed_chunks = True
-            yield "data: " + json.dumps({
-                "id": "chatcmpl-stream",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
-            }, ensure_ascii=False) + "\n\n"
+            
+            if item.get("type") == "content":
+                yield "data: " + json.dumps({
+                    "id": "chatcmpl-stream",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": item["data"]}, "finish_reason": None}]
+                }, ensure_ascii=False) + "\n\n"
+            elif item.get("type") == "tool_calls":
+                yield "data: " + json.dumps({
+                    "id": "chatcmpl-stream",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"tool_calls": item["data"]}, "finish_reason": None}]
+                }, ensure_ascii=False) + "\n\n"
 
         result = await task
+        if result.get("success"):
+            _last_chat_id = chat_id
+            response_parent_id = result.get("response_id") or payload.get("parent_id")
+            if response_parent_id:
+                _last_parent_id = response_parent_id
+            
+            if chat_id and token_info:
+                _chat_account_map[chat_id] = token_info.get("id")
+
         if not result.get("success"):
             if not has_streamed_chunks:
                 err_text = f"Ошибка: {result.get('error', 'Ошибка Qwen API')}"
@@ -592,12 +675,18 @@ async def _stream_openai_response(token_info, chat_id: str, payload: Dict[str, A
                 "choices": [{"index": 0, "delta": {"content": result["content"]}, "finish_reason": None}]
             }, ensure_ascii=False) + "\n\n"
 
+        finish_reason = "stop"
+        if result.get("tool_calls"):
+            finish_reason = "tool_calls"
+
+        logger.info(f"Stream finished: success={result.get('success')}, tool_calls={bool(result.get('tool_calls'))}, finish_reason={finish_reason}")
+
         yield "data: " + json.dumps({
             "id": "chatcmpl-stream",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
         }, ensure_ascii=False) + "\n\n"
         yield "data: [DONE]\n\n"
     finally:
@@ -605,6 +694,8 @@ async def _stream_openai_response(token_info, chat_id: str, payload: Dict[str, A
             task.cancel()
 
 async def handle_chat_completions(body: Dict[str, Any]):
+    global _last_chat_id, _last_parent_id
+
     messages = _extract_messages(body)
     if not messages:
         return JSONResponse(status_code=400, content={"error": "Сообщения не указаны"})
@@ -613,7 +704,22 @@ async def handle_chat_completions(body: Dict[str, Any]):
     stream = bool(body.get("stream", False))
     mapped_model = get_mapped_model(model)
 
-    token_info = get_available_token()
+    chat_id, parent_id = _extract_chat_ids(body)
+    
+    # Привязка чата к аккаунту: если чат уже существует, используем тот же аккаунт
+    token_info = None
+    if chat_id and chat_id in _chat_account_map:
+        target_acc = _chat_account_map[chat_id]
+        tokens = load_tokens()
+        token_info = next((t for t in tokens if t.get("id") == target_acc and not t.get("invalid")), None)
+        if token_info:
+            logger.info(f"Reusing account {target_acc} for chat {chat_id}")
+        else:
+            logger.warning(f"Account {target_acc} for chat {chat_id} unavailable, falling back")
+
+    if not token_info:
+        token_info = get_available_token()
+
     if not token_info:
         return JSONResponse(status_code=401, content={"error": "Нет доступных аккаунтов."})
 
@@ -626,12 +732,23 @@ async def handle_chat_completions(body: Dict[str, Any]):
 
     message_content = _normalize_message_content(user_msg_obj.get("content", ""))
     files = user_msg_obj.get("files") if isinstance(user_msg_obj.get("files"), list) else body.get("files") or []
+    tools = body.get("tools")
+    
+    logger.info(f"Tools in request: {len(tools) if tools else 0} tools, chat_id={chat_id or 'NEW'}, parent_id={parent_id}")
 
-    chat_id, parent_id = _extract_chat_ids(body)
+    # Fallback logic: use last chat if no specific chat requested
+    if not chat_id and _last_chat_id:
+        chat_id = _last_chat_id
+        if not parent_id and _last_parent_id:
+            parent_id = _last_parent_id
+
     if not chat_id:
         chat_id = await create_qwen_chat(token_info, mapped_model)
         if not chat_id:
             return JSONResponse(status_code=500, content={"error": "Не удалось создать чат в Qwen"})
+        if chat_id:
+            _chat_account_map[chat_id] = token_info.get("id")
+            logger.info(f"Mapped chat {chat_id} → account {token_info.get('id')}")
 
     payload = build_qwen_payload(
         message_content,
@@ -639,7 +756,8 @@ async def handle_chat_completions(body: Dict[str, Any]):
         chat_id,
         parent_id=parent_id,
         system_message=system_msg,
-        files=files
+        files=files,
+        tools=tools
     )
 
     if stream:
@@ -666,13 +784,22 @@ async def handle_chat_completions(body: Dict[str, Any]):
             content={"error": {"message": result.get("details") or result.get("error") or "Ошибка Qwen API", "type": "upstream_error"}}
         )
 
+    # Update global state after successful completion
+    _last_chat_id = chat_id
     response_parent_id = result.get("response_id") or parent_id
+    if response_parent_id:
+        _last_parent_id = response_parent_id
+    
+    if chat_id and token_info:
+        _chat_account_map[chat_id] = token_info.get("id")
+
     return _build_openai_completion(
         result.get("content", ""),
         model,
         chat_id,
         response_parent_id,
         usage=result.get("usage"),
+        tool_calls=result.get("tool_calls")
     )
 
 @app.get("/api/chat/completions")
