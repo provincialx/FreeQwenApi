@@ -1017,6 +1017,14 @@ router.post("/chat", async (req, res) => {
     let allMessages = messages; // Сохраняем всю историю
     const isMeta = isOpenWebUiMetaRequest(messages);
 
+        // Sliding Window: cut massive agent-loops to ~40 last steps + system prompt to save context from crashing Qwen API
+    if (messages.length > 60) {
+        const sysMsgs = messages.filter(m => m.role === 'system');
+        const nonSys = messages.filter(m => m.role !== 'system').slice(-40);
+        // @ts-ignore - we modify the array to fit browser API limits
+        messages = [...sysMsgs, ...nonSys];
+    }
+
     if (messages && Array.isArray(messages)) {
       const parsed = parseOpenAIMessages(messages);
       systemMessage = parsed.systemMessage;
@@ -1517,10 +1525,9 @@ router.post("/chat/completions", async (req, res) => {
       );
     }
 
-    // Логируем полную историю сообщений
-    logInfo(
-      `История содержит ${messages.length} сообщений: ${messages.map((m) => m.role).join(", ")}`,
-    );
+    // Сворачиваем историю, чтобы не превращать консоль в "потрошное месиво" при agent-loop (tool_calls)
+    const roleCounts = {}; messages.forEach(m => { if (m?.role) roleCounts[m.role] = (roleCounts[m.role] || 0) + 1; });
+    logInfo(`История: ${messages.length} сообщений (${Object.entries(roleCounts).map(([r,c]) => `${c}${c>1?'x':''} ${r}`).join(", ")})`);
     if (effectiveChatId) {
       logInfo(
         `Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || "null"}`,
@@ -1952,10 +1959,9 @@ router.post("/v1/chat/completions", async (req, res) => {
       );
     }
 
-    // Логируем полную историю сообщений
-    logInfo(
-      `История содержит ${messages.length} сообщений: ${messages.map((m) => m.role).join(", ")}`,
-    );
+    // Сворачиваем историю, чтобы не превращать консоль в "потрошное месиво" при agent-loop (tool_calls)
+    const roleCounts = {}; messages.forEach(m => { if (m?.role) roleCounts[m.role] = (roleCounts[m.role] || 0) + 1; });
+    logInfo(`История: ${messages.length} сообщений (${Object.entries(roleCounts).map(([r,c]) => `${c}${c>1?'x':''} ${r}`).join(", ")})`);
     if (effectiveChatId) {
       logInfo(
         `Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || "null"}`,
