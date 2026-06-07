@@ -1,0 +1,1 @@
+{"model":"qwen3.7-max","stream":true,"messages":[{"role":"user","content":"call test_echo with hello"}],"tools":[{"type":"function","function":{"name":"test_echo","description":"Echo test","parameters":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}}}]}

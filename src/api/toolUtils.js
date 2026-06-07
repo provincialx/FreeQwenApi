@@ -125,9 +125,15 @@ ${JSON.stringify(
 If no tool is needed and no skill rule applies, answer normally.`;
 }
 
+export const lastRawContentForDebug = { value: null };
+
 export function parseToolCallJson(content) {
   if (typeof content !== "string") return null;
   let text = content.trim();
+
+  // Debug: save raw input
+  lastRawContentForDebug.value = text.substring(0, 300);
+  console.log(`[TOOL_PARSE] input=${text.substring(0, 200)}`);
   const fence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   if (fence) text = fence[1].trim();
 
