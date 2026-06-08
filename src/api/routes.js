@@ -248,13 +248,40 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas
+    let zedToolsPrompt = '';
+    if (!allFailed && Array.isArray(combinedTools) && combinedTools.length > 0) {
+      zedToolsPrompt = toolsToPrompt(combinedTools);
+    }
+
+    // Inject Zed tool protocol into the user message content.
+    // Qwen Chat API ignores system_message when continuing existing chats,
+    // so instructions MUST be in the user-facing message text to take effect.
+    if (zedToolsPrompt) {
+      const prefix = zedToolsPrompt + '\n\nПользовательский запрос / текущий контекст:\n';
+      if (typeof messageContent === 'string') {
+        messageContent = prefix + messageContent;
+      } else if (Array.isArray(messageContent)) {
+        let inserted = false;
+        const updated = messageContent.map(item => {
+          if (!inserted && typeof item === 'object' && item?.type === 'text') {
+            const newItem = { ...item, text: prefix + String(item.text || '') };
+            inserted = true;
+            return newItem;
+          }
+          return item;
+        });
+        if (!inserted) {
+          updated.unshift({ type: 'text', text: prefix.trimEnd() });
+        }
+        messageContent = updated;
+      }
+    }
+
     let finalSystemMessage = allFailed
       ? systemMessage
       : applyToolPrompt(systemMessage, combinedTools, inAgentLoop);
 
     // Anti-hallucination: inject project context ONCE into system message.
-    // System prompt processed by Qwen at the start of generation — not on every reply.
-    // Appending to user message reprocesses it each turn → latency spike. System message = free.
     const projectContext = buildProjectContext();
     if (projectContext) {
       finalSystemMessage = `${finalSystemMessage || ""}\n\n${projectContext}`;

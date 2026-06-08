@@ -116,6 +116,16 @@ function buildPayloadV2(
     feature_config: {
       thinking_enabled: false,
       output_schema: "phase",
+      // Disable Qwen Chat built-in tools so external clients (Zed) remain the only tool executor.
+      auto_search: false,
+      web_search: false,
+      search_enabled: false,
+      online_search: false,
+      internet_search: false,
+      research_mode: "none",
+      code_interpreter: false,
+      browser_enabled: false,
+      plugins_enabled: false,
     },
   };
 
@@ -128,6 +138,19 @@ function buildPayloadV2(
     model,
     parent_id: parentId,
     timestamp: Math.floor(Date.now() / 1000),
+    // Disable Qwen built-in tools at payload level too
+    auto_search: false,
+    web_search: false,
+    search_enabled: false,
+    online_search: false,
+    internet_search: false,
+    search: false,
+    research_mode: "none",
+    code_interpreter: false,
+    browser_enabled: false,
+    plugins_enabled: false,
+    tools_enabled: false,
+    builtin_tools_enabled: false,
   };
 
   if (systemMessage) {
@@ -136,13 +159,8 @@ function buildPayloadV2(
       `System message: ${systemMessage.substring(0, 100)}${systemMessage.length > 100 ? "..." : ""}`,
     );
   }
-  // Tool prompt already injected in routes.js via applyToolPrompt before calling sendMessage.
-  // Do NOT double-inject here — payload.system_message set above is final.
-  if (tools && Array.isArray(tools) && tools.length > 0) {
-    logDebug(
-      `Tools passed to buildPayloadV2: ${tools.length} (already injected in system message)`,
-    );
-  }
+  // Tool prompt injected in routes.js into both user message content AND system_message.
+  // The payload.content now carries the full Zed tool protocol instructions.
 
   return payload;
 }
