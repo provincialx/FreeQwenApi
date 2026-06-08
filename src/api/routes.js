@@ -533,7 +533,11 @@ router.post("/chat/completions", async (req, res) => {
           // When we parsed tool calls and got visible text (stripped of JSON marker),
           // use that to prevent leaking {"tool_calls":[]} into the user-visible response.
           let content = result.choices[0].message.content;
-          if (parts?.visible !== null && parts.visible !== undefined) {
+          if (
+            parts &&
+            typeof parts === "object" &&
+            parts.visible !== undefined
+          ) {
             content = parts.visible || content;
           }
           logDebug(`JSON response content length: ${content.length}`);
