@@ -234,7 +234,16 @@ function shouldPersistSessionContext(scope = null) {
 
 // Глобальное fallback-хранилище: один чат на модель для агентов без conversation_hint.
 // Предотвращает мультипликацию чатов когда клиент (Zed) не передаёт chatId/conversation_id.
-const modelDefaultChats = new Map(); // model -> {chatId, parentId, timestamp}
+const modelDefaultChats = new Map(); // model -> {chatId, parentId, timestamp, toolCallCount}
+
+/**
+ * Auto-reset контекста Qwen чата после N вызовов инструментов.
+ * Накопленный инструментальный контекст заставляет модель `qwen3.7-max` отвечать текстом вместо JSON.
+ * Fresh chat = стабильный tool call parsing.
+ * Конфигурация через TOOL_CALL_RESET_THRESHOLD (по умолчанию: 8)
+ */
+const TOOL_CALL_RESET_THRESHOLD =
+  Number(process.env.TOOL_CALL_RESET_THRESHOLD) || 8;
 
 function getOrCreateModelDefaultChat(model) {
   const existing = modelDefaultChats.get(model);
@@ -248,10 +257,12 @@ function getOrCreateModelDefaultChat(model) {
 }
 
 function saveModelDefaultChat(model, chatId, parentId) {
+  const existing = modelDefaultChats.get(model);
   modelDefaultChats.set(model, {
     chatId,
     parentId,
     timestamp: Date.now(),
+    toolCallCount: existing?.toolCallCount || 0,
   });
   logDebug(`Default чат для ${model}: ${chatId}`);
 }
@@ -1442,7 +1453,7 @@ router.post("/chat/completions", async (req, res) => {
       );
     }
 
-    const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas; эмулируем через JSON prompt ниже.
+    const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas
     const toolAwareSystemMessage = allFailed
       ? systemMessage
       : applyToolPrompt(systemMessage, combinedTools, inAgentLoop);
@@ -1585,6 +1596,17 @@ router.post("/chat/completions", async (req, res) => {
           );
           if (toolCalls && toolCalls.length > 0) {
             writeToolCallsSse(res, mappedModel, result, toolCalls);
+            // Auto-reset: инкремент после успешного вызова инструмента.
+            const defChat = modelDefaultChats.get(mappedModel);
+            if (defChat && !explicitChatId) {
+              defChat.toolCallCount = (defChat.toolCallCount || 0) + 1;
+              if (defChat.toolCallCount >= TOOL_CALL_RESET_THRESHOLD) {
+                logInfo(
+                  `♻️ Auto-reset: достигнут лимит ${TOOL_CALL_RESET_THRESHOLD} tool calls. Инвалидация чата для ${mappedModel}`,
+                );
+                invalidateModelDefaultChat(mappedModel);
+              }
+            }
             return;
           }
         }
@@ -1991,10 +2013,11 @@ router.post("/v1/chat/completions", async (req, res) => {
       );
     }
 
-    const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas; эмулируем через JSON prompt ниже.
+    const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas
     const toolAwareSystemMessage = allFailed
       ? systemMessage
       : applyToolPrompt(systemMessage, combinedTools, inAgentLoop);
+
     if (toolAwareSystemMessage) {
       logInfo(
         `System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? "..." : ""}`,
@@ -2079,6 +2102,17 @@ router.post("/v1/chat/completions", async (req, res) => {
           );
           if (toolCalls && toolCalls.length > 0) {
             writeToolCallsSse(res, mappedModel, result, toolCalls);
+            // Auto-reset: инкремент после успешного вызова инструмента.
+            const defChat = modelDefaultChats.get(mappedModel);
+            if (defChat && !explicitChatId) {
+              defChat.toolCallCount = (defChat.toolCallCount || 0) + 1;
+              if (defChat.toolCallCount >= TOOL_CALL_RESET_THRESHOLD) {
+                logInfo(
+                  `♻️ Auto-reset: достигнут лимит ${TOOL_CALL_RESET_THRESHOLD} tool calls. Инвалидация чата для ${mappedModel}`,
+                );
+                invalidateModelDefaultChat(mappedModel);
+              }
+            }
             return;
           }
         }

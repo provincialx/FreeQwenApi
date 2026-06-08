@@ -1262,7 +1262,14 @@ export async function sendMessage(
         onChunk(response.data.choices[0].message.content);
       } else {
         const dbgContent = response.data.choices?.[0]?.message?.content;
-        logInfo("CAPTURE MODE: content type=" + typeof(dbgContent) + ", len=" + (dbgContent?.length ?? 0) + ", preview=" + JSON.stringify(dbgContent).substring(0,200));
+        logInfo(
+          "CAPTURE MODE: content type=" +
+            typeof dbgContent +
+            ", len=" +
+            (dbgContent?.length ?? 0) +
+            ", preview=" +
+            JSON.stringify(dbgContent).substring(0, 200),
+        );
       }
 
       return response.data;
@@ -1313,13 +1320,29 @@ export async function sendMessage(
       }
 
       // Handle Qwen API error: "The chat is in progress!" -> create new chat and retry once
-      if (response.errorBody && /chat is in progress/i.test(response.errorBody)) {
-        logWarn(`Qwen чат ${chatId} заблокирован ("in progress"). Создаю новый и повторяю запрос...`);
+      if (
+        response.errorBody &&
+        /chat is in progress/i.test(response.errorBody)
+      ) {
+        logWarn(
+          `Qwen чат ${chatId} заблокирован ("in progress"). Создаю новый и повторяю запрос...`,
+        );
         const newChatResult = await createChatV2(model, "Сессия", 0, chatType);
         if (newChatResult && newChatResult.chatId) {
           const retryResult = await sendMessage(
-            message, model, newChatResult.chatId, parentId, files, tools, toolChoice,
-            systemMessage, chatType, size, waitForCompletion, 1, onChunk,
+            message,
+            model,
+            newChatResult.chatId,
+            parentId,
+            files,
+            tools,
+            toolChoice,
+            systemMessage,
+            chatType,
+            size,
+            waitForCompletion,
+            1,
+            onChunk,
           );
           if (!retryResult.error) retryResult.newChatId = newChatResult.chatId;
           return retryResult;
