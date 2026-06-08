@@ -66,7 +66,169 @@ export function stringifyOpenAIContent(content) {
 
 // ─── Stateless Transcript Builder ─────────────────────────────────────────────
 
+/** Last message is tool result or assistant with tool_calls */
+export function isLastMessageToolState(messages) {
+  const last = [...(messages || [])].reverse().find((m) => m);
+  if (!last) return false;
+  return (
+    last.role === "tool" ||
+    last.role === "function" ||
+    (last.role === "assistant" &&
+      (last.tool_calls?.length > 0 || last.function_call))
+  );
+}
+
+/** Compact signature for dedup tool results */
+function _toolCallSignature(name, arguments_ = {}) {
+  const argsStr = JSON.stringify(arguments_);
+  return `${name}|${argsStr.substring(0, 200)}`;
+}
+
+/** Truncate text while preserving readability */
+function compactText(text, maxLen = 8000) {
+  if (!text || typeof text !== "string") return "";
+  const trimmed = text.trim();
+  if (trimmed.length <= maxLen) return trimmed;
+  return trimmed.substring(0, maxLen).trimEnd() + "...[content truncated]";
+}
+
+/** Collect deduped tool results from current turn */
+function collectCurrentToolTurn(messages) {
+  const msgs = messages || [];
+  let lastAssistIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (
+      msgs[i]?.role === "assistant" &&
+      (msgs[i].tool_calls?.length > 0 || msgs[i].function_call)
+    ) {
+      lastAssistIdx = i;
+      break;
+    }
+  }
+  const results = [];
+  for (let i = lastAssistIdx + 1; i < msgs.length; i++) {
+    if (msgs[i]?.role === "tool" || msgs[i]?.role === "function") {
+      results.push({
+        name: msgs[i].name || msgs[i].tool_call_id?.substring(0, 10) || "tool",
+        arguments: {},
+        content: stringifyOpenAIContent(msgs[i].content),
+      });
+    }
+  }
+  return [lastAssistIdx >= 0, results];
+}
+
+/** Build compact tool result summary (from Python fork).
+ * Dedup identical calls and add explicit continuation instructions.
+ * This prevents Qwen from echoing tool errors as its own response. */
+export function buildCompactToolResults(messages) {
+  const [, results] = collectCurrentToolTurn(messages);
+  if (!results || !results.length) return null;
+
+  // Dedup by signature, keep latest content per call pattern
+  const order = [];
+  const bySig = {};
+  for (const r of results) {
+    const sig =
+      _toolCallSignature(r.name, r.arguments) || `idx:${order.length}`;
+    if (!bySig[sig]) {
+      order.push(sig);
+    }
+    bySig[sig] = r;
+  }
+  const deduped = order.map((s) => bySig[s]);
+
+  // Find last user message as context anchor
+  const msgs = messages || [];
+  let lastUserIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+
+  const parts = [];
+  if (lastUserIdx >= 0) {
+    const originalUser = compactText(
+      stringifyOpenAIContent(msgs[lastUserIdx].content),
+      8000,
+    );
+    if (originalUser)
+      parts.push(`Исходная задача пользователя:\nUser: ${originalUser}`);
+  }
+
+  parts.push(
+    "Уже выполненные инструменты и их результаты в этой задаче (это твоя память — НЕ выполняй их заново):",
+  );
+
+  for (const r of deduped) {
+    const argsText = r.arguments ? JSON.stringify(r.arguments) : null;
+    const header = argsText
+      ? `${r.name || "tool"}(${argsText})`
+      : `${r.name || "tool"}()`;
+    parts.push(`\n${header}:\n${compactText(r.content, 1000)}`);
+  }
+
+  const resultTexts = deduped.map((r) => compactText(r.content, 1000));
+  const readonlyDone = deduped
+    .filter(
+      (r) =>
+        r.name &&
+        [
+          "list_directory",
+          "read_file",
+          "find_path",
+          "grep",
+          "diagnostics",
+        ].includes(r.name),
+    )
+    .map((r) => `${r.name || "tool"}()`);
+
+  // Error-specific instructions (from Python fork)
+  const lowerContents = resultTexts.join("\n").toLowerCase();
+  if (lowerContents.includes("outside the project")) {
+    parts.push(
+      "\nВажно: инструмент вернул ошибку про путь (outside the project). Повтори вызов с исправленным путём в том формате, который ожидает Zed; если повтор не помогает — объясни ограничение обычным текстом.",
+    );
+  }
+  if (resultTexts.some((t) => !t.trim())) {
+    parts.push(
+      "\nВажно: пустой вывод инструмента со Status: Completed — это уже результат, а не повод повторять тот же вызов.",
+    );
+  }
+  if (readonlyDone.length > 0) {
+    parts.push(
+      `\nТы уже осмотрел эти пути/файлы: ${readonlyDone.join("; ")}. НЕ вызывай list_directory/read_file повторно для них — вся информация уже есть выше.`,
+    );
+  }
+
+  // Explicit continuation instruction (critical for agent loop)
+  parts.push(
+    "\nПродолжи исходную задачу, опираясь на эту память. Не повторяй уже выполненные вызовы. Переходи к следующему конкретному шагу: создавай недостающие файлы через write_file, и только когда всё готово — дай финальный обычный ответ. Если нужен инструмент, ответь только минифицированным JSON tool_calls.",
+  );
+
+  const text = parts.join("\n");
+  const maxTotal = parseInt(process.env.TOOL_CONTEXT_MAX_CHARS || "32000", 10);
+  if (text.length > maxTotal) {
+    return (
+      text.substring(0, maxTotal).trimEnd() +
+      `\n\n...[tool context truncated to ${maxTotal} chars]`
+    );
+  }
+  return text;
+}
+
+/** Build stateless transcript with compact tool results when agent loop active.
+ * Uses Python-fork logic to prevent Qwen from echoing tool errors as its own response. */
 export function buildStatelessTranscript(messages) {
+  // When last message is tool result, use compact format for clean continuation
+  if (isLastMessageToolState(messages)) {
+    const compact = buildCompactToolResults(messages);
+    if (compact) return compact;
+  }
+
+  // Fallback: standard transcript folding
   const parts = [];
   for (const msg of messages || []) {
     if (!msg || msg.role === "system") continue;

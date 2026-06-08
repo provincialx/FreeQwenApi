@@ -769,7 +769,8 @@ export async function sendMessage(
     logDebug(
       `Отправка запроса к API v2 (model: ${payload.model}, chat_id: ${payload.chat_id})`,
     );
-    // logDebug("=== PAYLOAD V2 ===\n" + JSON.stringify(payload, null, 2)); // Disabled to reduce spam
+    // Full debug: enable for tool-calling troubleshooting only!
+    // logDebug("=== PAYLOAD V2 ===\n" + JSON.stringify(payload, null, 2));
     logInfo(
       `Отправка сообщения в чат ${chatId} с parent_id: ${parentId || "null"}`,
     );
