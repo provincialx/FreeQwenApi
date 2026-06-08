@@ -71,4 +71,7 @@ export const ALLOW_UNSCOPED_SESSION_CHAT_RESTORE = toBoolean(
 export const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 export const LOG_MAX_SIZE = Number(process.env.LOG_MAX_SIZE) || 5_242_880; // 5 MB
 export const LOG_MAX_FILES = Number(process.env.LOG_MAX_FILES) || 5;
-\nexport const REQUEST_TIMEOUT_MINUTES = Number(process.env.REQUEST_TIMEOUT_MINUTES) || 3;
+
+// Время ожидания ответа от модели Qwen в минутах (по умолчанию 3)
+export const REQUEST_TIMEOUT_MINUTES =
+  Number(process.env.REQUEST_TIMEOUT_MINUTES) || 3;
