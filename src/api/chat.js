@@ -121,9 +121,6 @@ export function getAvailableModelsFromFile() {
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith("#"));
 
-    logInfo("===== ДОСТУПНЫЕ МОДЕЛИ =====");
-    models.forEach((m) => logInfo(`- ${m}`));
-    logInfo("============================");
     return models;
   } catch (error) {
     logError("Ошибка при чтении файла с моделями", error);
