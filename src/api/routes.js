@@ -6,6 +6,7 @@ import {
   truncateForPrompt,
   compactJsonSchema,
   toolsToPrompt,
+  toolsToLightPrompt,
   parseToolCallParts,
   normalizeToolCalls,
   applyToolPrompt,
@@ -248,13 +249,19 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas
+
+    // Use SAME prompt variant for both system_message AND content prefix.
+    // Mixing verbose + light creates conflicting instructions that confuse Qwen
+    // into generating plain text instead of JSON tool_calls.
     let zedToolsPrompt = "";
     if (
       !allFailed &&
       Array.isArray(combinedTools) &&
       combinedTools.length > 0
     ) {
-      zedToolsPrompt = toolsToPrompt(combinedTools);
+      zedToolsPrompt = inAgentLoop
+        ? toolsToLightPrompt(combinedTools)
+        : toolsToPrompt(combinedTools);
     }
 
     // Inject Zed tool protocol into the user message content.

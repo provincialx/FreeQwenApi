@@ -80,21 +80,21 @@ export function toolsToPrompt(tools) {
 
   // Skill view specific injection only if present
   const skillRules = schemas.some((s) => s.name === "skill_view")
-    ? `\nCRITICAL: If user asks about skills/config/setup, ALWAYS call skill_view first. Then answer.`
+    ? `\nCRITICAL: If user asks about skills/config/setup, ALWAYS call skill_view first.`
     : "";
 
   return `
-INSTRUCTIONS:
-To perform actions (file read/write, commands, search), you MUST output tool calls in JSON format at the VERY END of your response.
+=== TOOL USAGE RULES ===
+DECISION TREE:
+- User wants to READ/CREATE/MODIFY files → CALL a tool NOW
+- User wants to RUN commands/search/deploy → CALL a tool NOW
+- User asks questions or explains concepts → ANSWER in plain text
+- You have tool results but need MORE data → CALL another tool NOW
 
-FORMAT (minified, last line only, NO markdown fences):
-{"tool_calls": [{"name": "<tool_name>", "arguments": {}}]}
-
-ALLOWED TOOLS: ${toolNames}
-${skillRules}
-DO NOT invent tool names. DO NOT use prose like "I will run..." to simulate action.
-If no action needed, answer normally in text.
-`;
+FORMAT: output minified JSON as the LAST LINE of your response:
+{"tool_calls":[{"name":"<tool_name>","arguments":{}}]}
+DO NOT wrap in markdown fences. DO NOT use prose to simulate action.
+Available tools: ${toolNames}${skillRules}`;
 }
 
 // ─── Raw JSON parser helpers (from Python fork) ──────────────────────────────
@@ -371,7 +371,7 @@ export function applyToolPrompt(systemMessage, tools, inAgentLoop = false) {
   return prompt ? `${systemMessage || ""}${prompt}`.trim() : systemMessage;
 }
 
-/** Light tool prompt for agent-loop: model has tool results, should synthesize answer */
+/** Light tool prompt for agent-loop: model has tool results, should synthesize or continue */
 export function toolsToLightPrompt(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return "";
 
@@ -380,13 +380,17 @@ export function toolsToLightPrompt(tools) {
     .filter(Boolean)
     .join(", ");
 
+  // Same STRICT format as toolsToPrompt — consistency prevents Qwen confusion between modes.
+  // Light mode only differs in priority: prefer text answer when results already exist,
+  // but still force tool call for further actions (more reads, commands, verification).
   return `
+=== TOOL USAGE RULES ===
+You received results from prior tool calls. Continue work or finish:
+- Need MORE data/action → CALL a tool NOW
+- All data collected, can answer/synthesize → WRITE plain text response
 
-TOOL CALLING ADAPTER.
-You have received results from prior tool calls. Use these results to form your answer.
-If further action is needed (e.g., more files to read, commands to run, verification), YOU MUST call a tool immediately.
-Available tools: ${toolNames}
-To call another tool, respond with minified JSON on the LAST line:
-{"tool_calls":[{"name":"tool_name","arguments":{}}]}
-Only answer in text if you have ALL needed information and no further actions are required.`;
+FORMAT for tool call (minified JSON, LAST LINE):
+{"tool_calls":[{"name":"<tool_name>","arguments":{}}]}
+DO NOT wrap in markdown fences.
+Available tools: ${toolNames}`;
 }
