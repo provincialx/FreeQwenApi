@@ -6,7 +6,8 @@ import {
   truncateForPrompt,
   compactJsonSchema,
   toolsToPrompt,
-  parseToolCallJson,
+  parseToolCallParts,
+  normalizeToolCalls,
   applyToolPrompt,
 } from "./toolUtils.js";
 import { logInfo, logError, logWarn, logDebug } from "../logger/index.js";
@@ -382,11 +383,19 @@ router.post("/chat/completions", async (req, res) => {
         );
 
         if (captureToolCalls) {
-          const toolCalls = parseToolCallJson(
+          const parts = parseToolCallParts(
             result?.choices?.[0]?.message?.content,
           );
+          const rawCalls = parts.calls || [];
+          const toolCalls = normalizeToolCalls(rawCalls);
           if (toolCalls && toolCalls.length > 0) {
-            writeToolCallsSse(res, mappedModel, result, toolCalls);
+            writeToolCallsSse(
+              res,
+              mappedModel,
+              result,
+              toolCalls,
+              parts.visible,
+            );
             // Auto-reset: инкремент после успешного вызова инструмента.
             const defChat = getModelDefaultChats().get(mappedModel);
             if (defChat && !explicitChatId) {
@@ -524,12 +533,17 @@ router.post("/chat/completions", async (req, res) => {
         });
       }
 
-      const toolCalls = parseToolCallJson(
-        result?.choices?.[0]?.message?.content,
-      );
+      const parts = parseToolCallParts(result?.choices?.[0]?.message?.content);
+      const rawCalls = parts.calls || [];
+      const toolCalls = normalizeToolCalls(rawCalls);
       if (toolCalls && toolCalls.length > 0) {
         return res.json(
-          buildOpenAIToolResponse(result, mappedModel, toolCalls),
+          buildOpenAIToolResponse(
+            result,
+            mappedModel,
+            toolCalls,
+            parts.visible,
+          ),
         );
       }
 

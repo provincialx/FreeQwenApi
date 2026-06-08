@@ -4,7 +4,12 @@ import { sendMessage } from "./chat.js";
 
 // ─── OpenAI Tool Response Builder ─────────────────────────────────────────────
 
-export function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
+export function buildOpenAIToolResponse(
+  result,
+  mappedModel,
+  toolCalls,
+  visibleText,
+) {
   return {
     id: result.id || "chatcmpl-" + Date.now(),
     object: "chat.completion",
@@ -15,7 +20,8 @@ export function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
         index: 0,
         message: {
           role: "assistant",
-          content: null,
+          content:
+            visibleText && visibleText.trim() ? visibleText.trim() : null,
           tool_calls: toolCalls.map(({ index, ...call }) => call),
         },
         finish_reason: "tool_calls",
@@ -35,13 +41,21 @@ export function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
 
 // ─── SSE Helpers ──────────────────────────────────────────────────────────────
 
-export function writeToolCallsSse(res, mappedModel, result, toolCalls) {
+export function writeToolCallsSse(
+  res,
+  mappedModel,
+  result,
+  toolCalls,
+  visibleText,
+) {
   const base = {
     id: result.id || "chatcmpl-stream",
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
     model: result.model || mappedModel || "qwen-max-latest",
   };
+
+  // Role placeholder chunk
   res.write(
     "data: " +
       JSON.stringify({
@@ -52,6 +66,23 @@ export function writeToolCallsSse(res, mappedModel, result, toolCalls) {
       }) +
       "\n\n",
   );
+
+  // Reasoning/visible text chunk — sent BEFORE tool_calls so Zed gets context
+  if (visibleText && visibleText.trim()) {
+    const contentChunk = JSON.stringify({
+      ...base,
+      choices: [
+        {
+          index: 0,
+          delta: { content: visibleText.trim() },
+          finish_reason: null,
+        },
+      ],
+    });
+    logDebug(`🔨 SSE reasoning chunk: ${contentChunk}`);
+    res.write("data: " + contentChunk + "\n\n");
+  }
+
   for (const call of toolCalls) {
     const chunk = JSON.stringify({
       ...base,
