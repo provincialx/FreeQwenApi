@@ -813,18 +813,46 @@ export async function sendMessage(
         onChunk,
       );
 
+      // Distinguish between parent_id not exist and chat not exist.
+      // "parent_id X is not exist" means the stale parentId was cached — just reset it.
+      // True chat_not_exist errors don't mention parent_id specifically.
+      if (
+        response.errorBody &&
+        /not exist/i.test(response.errorBody) &&
+        /parent_id/i.test(response.errorBody)
+      ) {
+        logWarn(
+          `Stale parentId ${parentId} — retry without it on chat ${chatId}`,
+        );
+        if (retryCount < 1) {
+          const retryResult = await sendMessage(
+            message,
+            model,
+            chatId, // keep existing chat
+            null, // parentId: reset stale parent reference
+            files,
+            tools,
+            toolChoice,
+            systemMessage,
+            retryCount + 1,
+            onChunk,
+          );
+          return retryResult;
+        }
+      }
+
       if (response.errorBody && /not exist/i.test(response.errorBody)) {
         logWarn(
           `Qwen чат ${chatId} больше не существует. Создаю новый и повторяю запрос...`,
         );
         const newChatResult = await createChatV2(model, "Сессия", 0);
         if (newChatResult && newChatResult.chatId) {
-          // Retry with new chat. Mark result so routes knows to update default cache.
+          // Retry with new chat. Reset parentId — old parent message doesn't exist in the new chat.
           const retryResult = await sendMessage(
             message,
             model,
             newChatResult.chatId,
-            parentId,
+            null, // parentId: reset for new chat
             files,
             tools,
             toolChoice,
@@ -850,11 +878,12 @@ export async function sendMessage(
         );
         const newChatResult = await createChatV2(model, "Сессия", 0);
         if (newChatResult && newChatResult.chatId) {
+          // Reset parentId — old parent message doesn't exist in the new chat.
           const retryResult = await sendMessage(
             message,
             model,
             newChatResult.chatId,
-            parentId,
+            null, // parentId: reset for new chat
             files,
             tools,
             toolChoice,

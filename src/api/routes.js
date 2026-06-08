@@ -248,8 +248,12 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas
-    let zedToolsPrompt = '';
-    if (!allFailed && Array.isArray(combinedTools) && combinedTools.length > 0) {
+    let zedToolsPrompt = "";
+    if (
+      !allFailed &&
+      Array.isArray(combinedTools) &&
+      combinedTools.length > 0
+    ) {
       zedToolsPrompt = toolsToPrompt(combinedTools);
     }
 
@@ -257,21 +261,22 @@ router.post("/chat/completions", async (req, res) => {
     // Qwen Chat API ignores system_message when continuing existing chats,
     // so instructions MUST be in the user-facing message text to take effect.
     if (zedToolsPrompt) {
-      const prefix = zedToolsPrompt + '\n\nПользовательский запрос / текущий контекст:\n';
-      if (typeof messageContent === 'string') {
+      const prefix =
+        zedToolsPrompt + "\n\nПользовательский запрос / текущий контекст:\n";
+      if (typeof messageContent === "string") {
         messageContent = prefix + messageContent;
       } else if (Array.isArray(messageContent)) {
         let inserted = false;
-        const updated = messageContent.map(item => {
-          if (!inserted && typeof item === 'object' && item?.type === 'text') {
-            const newItem = { ...item, text: prefix + String(item.text || '') };
+        const updated = messageContent.map((item) => {
+          if (!inserted && typeof item === "object" && item?.type === "text") {
+            const newItem = { ...item, text: prefix + String(item.text || "") };
             inserted = true;
             return newItem;
           }
           return item;
         });
         if (!inserted) {
-          updated.unshift({ type: 'text', text: prefix.trimEnd() });
+          updated.unshift({ type: "text", text: prefix.trimEnd() });
         }
         messageContent = updated;
       }
@@ -424,17 +429,20 @@ router.post("/chat/completions", async (req, res) => {
               parts.visible,
             );
 
-            // Invalidate stale chat caches after retry-created chats.
-            // captureToolCalls path returns early here, skipping persistSessionState.
-            // Without this, next agent-loop request still gets old dead chatId from modelDefaultChats.
-            if (result.newChatId) {
-              invalidateModelDefaultChat(mappedModel);
-              logInfo(
-                `♻️ Инвалидация кэша после создания нового чата: ${result.newChatId}`,
-              );
-            }
+            // Persist session AFTER writeToolCallsSse — captureToolCalls path
+            // skips this by returning early, so scoped+default caches need explicit save.
+            persistSessionState(
+              result,
+              qwenChatId,
+              isMeta,
+              effectiveChatId,
+              conversationScope,
+              mappedModel,
+              req,
+              effectiveParentId,
+            );
 
-            // Auto-reset: инкремент после успешного вызова инструмента.
+            // Auto-reset: инкремент toolCallCount после успешного вызова инструмента.
             const defChat = getModelDefaultChats().get(mappedModel);
             if (defChat && !explicitChatId) {
               defChat.toolCallCount = (defChat.toolCallCount || 0) + 1;
