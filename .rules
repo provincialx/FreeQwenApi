@@ -1,3 +1,9 @@
+## Tool Usage Policy
+- Всегда используй тулзы (list_directory, read_file, grep) для проверки состояния файлов и кода.
+- Никогда не отвечай о наличии/отсутствии файлов или содержимом кода по памяти — только через тулзы.
+- При аудите всегда начинай с list_directory и read_file.
+- Если пользователь спрашивает «есть ли файл X?» — вызови list_directory, а не отвечай из контекста.
+
 Read full documents at the entrance .md and update any changes.
 Commit any changes and push to the repository.
 
@@ -75,7 +81,7 @@ Commit any changes and push to the repository.
 - `src/api/chatHistory.js` — локальное хранение истории (JSON).
 - `src/api/fileUpload.js` — загрузка файлов через STS token + OSS.
 - `src/api/modelMapping.js` — маппинг имён моделей.
-- `src/api/projectContext.js` — рекурсивный scan файловой системы, kэш 30s TTL. Anti-hallucination: inject актуальной структуры проекта в user message (исключая `node_modules`, `.git`).
+- `src/api/projectContext.js` — рекурсивный scan файловой системы, кэш 60s TTL. Anti-hallucination: inject актуальной структуры проекта в user message (исключая `node_modules`, `.git`, `session`, `logs`, `uploads`).
 - `src/config.js` — константы: таймауты, лимиты, пути, настройки сервера.
 - `src/utils/branding.js` — водяной знак ForgetMeAI.
 - `src/utils/prompt.js` — утилиты для промптов.
