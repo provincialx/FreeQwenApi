@@ -3,6 +3,8 @@
 // Direct import of authToken — safe in ESM circular deps (top-level binding).
 import {
   authToken,
+  availableModels,
+  getAvailableModelsFromFile,
   extractAuthToken,
   browserTokenRateLimited,
   isValidModel,

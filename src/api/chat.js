@@ -101,7 +101,7 @@ const __dirname = path.dirname(__filename);
 const MODELS_FILE = path.join(__dirname, "..", "AvailableModels.txt");
 const AUTH_KEYS_FILE = path.join(__dirname, "..", "Authorization.txt");
 
-let availableModels = null;
+export let availableModels = null;
 let authKeys = null;
 
 export function getAvailableModelsFromFile() {
