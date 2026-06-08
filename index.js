@@ -14,7 +14,7 @@ import {
   logWarn,
 } from "./src/logger/index.js";
 import { prompt } from "./src/utils/prompt.js";
-import { FORGETMEAI_WATERMARK } from "./src/utils/branding.js";
+import { CONTACT_INFO, FORGETMEAI_WATERMARK } from "./src/utils/branding.js";
 import { PORT, HOST } from "./src/config.js";
 
 const app = express();
@@ -127,7 +127,7 @@ async function startServer() {
 ██      ██   ██ ███████ ███████  ██████   ███ ███  ███████ ██   ████ ██   ██ ██      ██
                                     ▀▀
    API-прокси для Qwen
-   ${FORGETMEAI_WATERMARK}
+   ${CONTACT_INFO}
 `);
 
   logInfo("Запуск сервера...");
@@ -157,7 +157,7 @@ async function startServer() {
         });
       }
       console.log("\n=== Меню ===");
-      console.log(`ForgetMeAI: ${FORGETMEAI_WATERMARK}`);
+      console.log(`${CONTACT_INFO}`);
       console.log("1 - Добавить новый аккаунт");
       console.log("2 - Перелогинить аккаунт с истекшим токеном");
       console.log("3 - Запустить прокси (по умолчанию)");
