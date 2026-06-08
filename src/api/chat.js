@@ -32,22 +32,27 @@ export async function clearPagePool() {
 // ─── Auth token state (owned by this module) ──────────────────────────────
 
 /** @type {string|null} */
-export let authToken = null;
-let browserTokenRateLimited = false;
+let _authToken = null;
+export let browserTokenRateLimited = false;
 
 export function getAuthToken() {
-  return authToken;
+  return _authToken;
 }
 
 export function setAuthToken(value) {
-  authToken = value;
+  _authToken = value;
+}
+
+export function getBrowserTokenRateLimited() {
+  return browserTokenRateLimited;
+}
+
+export function setBrowserTokenRateLimited(value) {
+  browserTokenRateLimited = value;
 }
 
 // Wire pagePool with a callback to check cached token before extracting on fresh pages
-setAuthTokenGetter(() => authToken);
-
-/** @type {typeof browserTokenRateLimited} exported for qwenApi.js */
-export { browserTokenRateLimited };
+setAuthTokenGetter(() => _authToken);
 
 // ─── Token extraction (browser layer) ──────────────────────────────────────
 
@@ -60,7 +65,7 @@ import {
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function extractAuthToken(context, forceRefresh = false) {
-  if (authToken && !forceRefresh) return authToken;
+  if (_authToken && !forceRefresh) return _authToken;
 
   try {
     const page = await createPage(context);
@@ -76,10 +81,10 @@ export async function extractAuthToken(context, forceRefresh = false) {
       if (shouldClosePage) await page.close();
 
       if (newToken) {
-        authToken = newToken;
+        _authToken = newToken;
         logInfo("Токен авторизации успешно извлечен");
-        saveAuthToken(authToken);
-        return authToken;
+        saveAuthToken(_authToken);
+        return _authToken;
       }
       logError("Токен авторизации не найден в браузере");
       return null;

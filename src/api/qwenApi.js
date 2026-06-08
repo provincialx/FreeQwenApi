@@ -1,10 +1,11 @@
-// Depends on chat.js for token state (getAuthToken/setAuthToken) and model validation.
-// Circular ESM dep is safe — functions are hoisted before runtime.
-// Direct import of authToken — safe in ESM circular deps (top-level binding).
+// Depends on chat.js for token state and model validation.
+// Use getters/setters — ESM import bindings are immutable.
 import {
-  authToken,
+  getAuthToken,
+  setAuthToken,
   extractAuthToken,
-  browserTokenRateLimited,
+  getBrowserTokenRateLimited,
+  setBrowserTokenRateLimited,
   isValidModel,
 } from "./chat.js";
 
@@ -60,12 +61,12 @@ function validateAndPrepareMessage(message) {
 async function resolveAuthToken(browserContext) {
   const tokenObj = await getAvailableToken();
   if (tokenObj && tokenObj.token) {
-    authToken = tokenObj.token;
+    setAuthToken(tokenObj.token);
     logInfo(`Используется аккаунт: ${tokenObj.id}`);
     return tokenObj;
   }
 
-  if (browserTokenRateLimited) {
+  if (getBrowserTokenRateLimited()) {
     logWarn("Browser-токен залимичен, пропускаем fallback");
     return null;
   }
@@ -76,12 +77,13 @@ async function resolveAuthToken(browserContext) {
     if (!authCheck) return null;
   }
 
-  if (!authToken) {
+  if (!getAuthToken()) {
     logInfo("Получение токена авторизации...");
-    authToken = await extractAuthToken(browserContext);
+    setAuthToken(await extractAuthToken(browserContext));
   }
 
-  return authToken ? { id: "browser", token: authToken } : null;
+  const token = getAuthToken();
+  return token ? { id: "browser", token } : null;
 }
 
 function buildPayloadV2(
@@ -564,7 +566,7 @@ async function handleApiError(
       "Обнаружена необходимость верификации, перезапуск браузера в видимом режиме...",
     );
     await pagePool.clear();
-    authToken = null;
+    setAuthToken(null);
     await shutdownBrowser();
     await initBrowser(true);
     return {
@@ -583,8 +585,8 @@ async function handleApiError(
     logWarn(
       `Токен ${tokenObj?.id} недействителен (401). Удаляем и пробуем другой.`,
     );
-    authToken = null;
-    browserTokenRateLimited = false;
+    setAuthToken(null);
+    setBrowserTokenRateLimited(false);
     if (tokenObj?.id && tokenObj.id !== "browser") {
       const { markInvalid } = await import("./tokenManager.js");
       markInvalid(tokenObj.id);
@@ -625,7 +627,7 @@ async function handleApiError(
     }
 
     if (tokenObj?.id === "browser") {
-      browserTokenRateLimited = true;
+      setBrowserTokenRateLimited(true);
       logWarn(`Browser-токен достиг лимита. Помечаем на ${hours}ч.`);
     } else if (tokenObj?.id) {
       markRateLimited(tokenObj.id, hours);
@@ -634,7 +636,7 @@ async function handleApiError(
       );
     }
 
-    authToken = null;
+    setAuthToken(null);
     const { hasValidTokens } = await import("./tokenManager.js");
     if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
       return sendMessage(
@@ -722,16 +724,16 @@ export async function sendMessage(
       });
     }
 
-    if (!authToken) {
+    if (!getAuthToken()) {
       logWarn("Токен отсутствует перед отправкой запроса");
-      authToken = await page.evaluate(() => localStorage.getItem("token"));
-      if (!authToken)
+      setAuthToken(await page.evaluate(() => localStorage.getItem("token")));
+      if (!getAuthToken())
         return {
           error:
             "Токен авторизации не найден. Требуется перезапуск в ручном режиме.",
           chatId,
         };
-      saveAuthToken(authToken);
+      saveAuthToken(getAuthToken());
     }
 
     logInfo("Отправка запроса к API v2...");
@@ -759,7 +761,7 @@ export async function sendMessage(
       page,
       apiUrl,
       payload,
-      authToken,
+      getAuthToken(),
       onChunk,
     );
 
@@ -871,14 +873,15 @@ export async function createChatV2(
 
   const tokenObj = await getAvailableToken();
   if (tokenObj?.token) {
-    authToken = tokenObj.token;
+    setAuthToken(tokenObj.token);
     logInfo(`Используется аккаунт для создания чата: ${tokenObj.id}`);
   }
 
-  if (!authToken) {
+  if (!getAuthToken()) {
     logInfo("Получение токена авторизации для создания чата...");
-    authToken = await extractAuthToken(browserContext);
-    if (!authToken) return { error: "Не удалось получить токен авторизации" };
+    setAuthToken(await extractAuthToken(browserContext));
+    if (!getAuthToken())
+      return { error: "Не удалось получить токен авторизации" };
   }
 
   let page = null;
@@ -892,7 +895,11 @@ export async function createChatV2(
       chat_type: "t2t",
       timestamp: Date.now(),
     };
-    const requestBody = { apiUrl: CREATE_CHAT_URL, payload, token: authToken };
+    const requestBody = {
+      apiUrl: CREATE_CHAT_URL,
+      payload,
+      token: getAuthToken(),
+    };
 
     const result = await page.evaluate(async (data) => {
       try {
