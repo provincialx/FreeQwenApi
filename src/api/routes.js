@@ -251,23 +251,12 @@ router.post("/chat/completions", async (req, res) => {
       ? systemMessage
       : applyToolPrompt(systemMessage, combinedTools, inAgentLoop);
 
-    // Anti-hallucination: inject project context at the END of last user message.
-    // Model weights recent tokens highest. Appending to user's last turn makes
-    // this the most salient information — prevents trusting stale training data.
+    // Anti-hallucination: inject project context ONCE into system message.
+    // System prompt processed by Qwen at the start of generation — not on every reply.
+    // Appending to user message reprocesses it each turn → latency spike. System message = free.
     const projectContext = buildProjectContext();
     if (projectContext) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i];
-        if (msg?.role === "user") {
-          if (typeof msg.content === "string") {
-            msg.content += "\n\n" + projectContext;
-          } else if (Array.isArray(msg.content)) {
-            // Append as text part to multimodal content
-            msg.content.push({ type: "text", text: "\n\n" + projectContext });
-          }
-          break;
-        }
-      }
+      finalSystemMessage = `${finalSystemMessage || ""}\n\n${projectContext}`;
     }
 
     // Сворачиваем историю, чтобы не превращать консоль в "потрошное месиво" при agent-loop (tool_calls)

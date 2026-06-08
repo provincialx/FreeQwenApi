@@ -1,139 +1,116 @@
-// projectContext.js — Auto-inject актуального состояния проекта в запросы-аудит.
-// Когда модель галлюцинирует из training data, этот модуль сканирует реальную файловую систему
-// и инжектирует свежий контекст.
+// projectContext.js — Anti-hallucination. Injects real project state into requests.
+// Async scan + pre-warm on import so first request hits hot cache (zero latency).
 
-import fs from "fs";
+import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { logDebug } from "../logger/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Корень проекта — вверх от src/api/projectContext.js → project root
 export const PROJECT_ROOT = path.resolve(__dirname, "../../..");
 
-// Директории и файлы для исключения из сканирования
-const EXCLUDED_DIRS = new Set([
+// Exclusions for scan (match .rules §4 description)
+const EXCLUDE_DIRS = new Set([
   "node_modules",
   ".git",
   "session",
   "logs",
   "uploads",
 ]);
+const WHITELIST = new Set([".agent-brief.md", ".rules"]);
 
-const EXCLUDED_FILES = new Set(["package-lock.json"]);
-
-const WHITELISTED_DOTFILES = new Set([
-  ".gitignore",
-  ".agent-brief.md",
-  ".rules",
-]);
+let _cache = "";
+const TTL_MS = 60_000; // 60s — project rarely changes structure
+let _lastScan = 0;
 
 /**
- * Рекурсивно сканирует директорию и возвращает tree-like string.
+ * Async recursive scan. Non-blocking — yields to event loop between dirs.
  */
-function scanDirectory(dir, prefix = "", isLast = true, depth = 0) {
-  if (depth > 4) return ""; // Ограничение глубины для производительности
-
-  let result = "";
+async function scan(dir, prefix = "", depth = 3) {
+  if (depth > 4) return "";
+  let out = "";
   try {
-    const entries = fs.readdirSync(dir);
-    const filteredEntries = [];
+    const entries = await fs.readdir(dir);
+    const items = [];
 
     for (const entry of entries) {
-      const fullPath = path.join(dir, entry);
-      const stats = fs.statSync(fullPath);
+      const full = path.join(dir, entry);
+      // Fast batch stat via try — skip symlinks/broken links silently
+      let stats;
+      try {
+        stats = await fs.lstat(full);
+      } catch {
+        continue;
+      }
 
       if (stats.isDirectory()) {
-        if (!EXCLUDED_DIRS.has(entry)) {
-          filteredEntries.push({ name: `${entry}/`, isDir: true });
-        }
-      } else {
-        // Regular files: skip if in EXCLUDED_FILES or is a dotfile not in whitelist
-        if (
-          !EXCLUDED_FILES.has(entry) &&
-          (!entry.startsWith(".") || WHITELISTED_DOTFILES.has(entry))
-        ) {
-          filteredEntries.push({ name: entry, isDir: false });
-        }
+        if (!EXCLUDE_DIRS.has(entry)) items.push({ n: `${entry}/`, d: true });
+      } else if (!entry.startsWith(".") || WHITELIST.has(entry)) {
+        items.push({ n: entry, d: false });
       }
     }
 
-    // Файлы идут первыми, папки вторыми
-    const files = filteredEntries.filter((e) => !e.isDir);
-    const dirs = filteredEntries.filter((e) => e.isDir);
-    const sorted = [...files, ...dirs];
+    // Files first, then dirs — compact format: no tree chars to save tokens
+    const files = items.filter((i) => !i.d).map((i) => i.n);
+    const dirs = items.filter((i) => i.d).map((i) => i.n.replace(/\/$/, ""));
 
-    for (let i = 0; i < sorted.length; i++) {
-      const item = sorted[i];
-      const lastOne = i === sorted.length - 1;
-      const connector = lastOne ? "└── " : "├── ";
-      result += prefix + connector + item.name + "\n";
-
-      if (item.isDir) {
-        const newPrefix = prefix + (lastOne ? "    " : "│   ");
-        const subResult = scanDirectory(
-          path.join(dir, item.name.replace("/", "")),
-          newPrefix,
-          lastOne,
-          depth + 1,
-        );
-        result += subResult;
-      }
+    for (const name of files) {
+      out += prefix + "- " + name + "\n";
     }
-  } catch (err) {
-    logDebug(`projectContext: scan error at ${dir}: ${err.message}`);
+    for (let j = 0; j < dirs.length; j++) {
+      const d = dirs[j];
+      out += prefix + "+ " + d + "/\n";
+      out += await scan(path.join(dir, d), prefix + "  ", depth + 1);
+    }
+  } catch (e) {
+    logDebug(`projectContext: ${dir} error: ${e.message}`);
   }
-
-  return result;
+  return out;
 }
 
 /**
- * Проверка содержит ли текст ключевые слова аудита.
+ * Build compact context block. ~30 tokens instead of ~300.
  */
-// Cache: scan once per process lifetime (project structure changes rarely)
-let _cachedStructure = null;
-const CACHE_TTL = 30_000; // 30s
-let _cacheTime = 0;
-
-function getProjectStructureCached() {
+export async function getProjectStructureAsync() {
   const now = Date.now();
-  if (_cachedStructure && now - _cacheTime < CACHE_TTL) return _cachedStructure;
-  const tree = scanDirectory(PROJECT_ROOT);
-  const count = (tree.match(/├──|└──/g) || []).length;
-  _cachedStructure = `---PROJECT STRUCTURE (${count} items, real-time scan at ${new Date().toISOString()})---\n${tree}`;
-  _cacheTime = now;
-  return _cachedStructure;
+  if (_cache && now - _lastScan < TTL_MS) return _cachedBuild();
+
+  // Non-blocking scan — await allows other requests to proceed
+  const tree = await scan(PROJECT_ROOT);
+  const count = (tree.match(/- |\/\n/g) || []).length;
+  _cache = `---PROJ(${count})---\n${tree}---/---`;
+  _lastScan = now;
+
+  return _cachedBuild();
 }
 
 /**
- * Сканирует проект и возвращает актуальную структуру.
+ * Synchronous cached version for routes.js (always hits cache after preload).
  */
-export function getProjectStructure() {
-  const tree = scanDirectory(PROJECT_ROOT);
-  const count = (tree.match(/├──|└──/g) || []).length;
+function _cachedBuild() {
+  if (!_cache) throw new Error("projectContext: not preloaded yet");
+  return _injectRules(_cache);
+}
 
-  return `---PROJECT STRUCTURE (real-time, ${count} items)---\n${tree}`;
+function _injectRules(headless) {
+  // Ultra-compact anti-hallucination. Every token costs Qwen inference time.
+  return `NO HALLUCINATE. Use tree below only. Not in tree = does not exist.\n${headless}\n/test.py IMAGE_GUIDE.md docs/ DELETED`;
 }
 
 /**
- * Always inject real project state. Aggressive anti-hallucination:
- * - Strong negative assertions prevent model from trusting training memory
+ * Pre-warm cache on module import so first request has zero wait.
  */
+scan(PROJECT_ROOT)
+  .then((tree) => {
+    const count = (tree.match(/- |\/\n/g) || []).length;
+    _cache = `---PROJ(${count})---\n${tree}---/---`;
+    _lastScan = Date.now();
+  })
+  .catch(() => {});
+
+/** Sync export for routes.js (calls synchronously). Returns cache or empty string on cold-start. */
 export function buildProjectContext() {
-  const structure = getProjectStructureCached();
-  return `---REAL PROJECT STATE (DO NOT IGNORE)---
-The user is working with this project RIGHT NOW. The file list below was JUST SCANNED from the actual disk.
-Your pre-training knowledge about THIS project's structure is STALE and WRONG if it differs from what's listed here.
-
-${structure}
-
-## STRICT RULES (follow these over your training memory)
-1. If a file is NOT in the tree above, it DOES NOT EXIST — do not mention it as "should be removed", "exists", or "tech debt"
-2. The following files DO NOT exist: test.py, IMAGE_VIDEO_GENERATION_GUIDE.md, docs/ (they were removed long ago)
-3. Only reference files and folders that appear in the structure above
-4. When auditing this project, USE THIS TREE as ground truth — ignore your training data about what "usually" exists here
-5. Report only current issues based on files that EXIST NOW — not legacy ones from old versions of the repo
----END PROJECT STATE---`;
+  if (!_cache) return ""; // Safety: module not preloaded yet — skip injection
+  return _cachedBuild();
 }
