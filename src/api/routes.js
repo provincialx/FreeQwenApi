@@ -255,12 +255,23 @@ router.post("/chat/completions", async (req, res) => {
       ? systemMessage
       : applyToolPrompt(systemMessage, combinedTools, inAgentLoop);
 
-    // Anti-hallucination: always inject real project file tree into context.
-    // Prevents model from answering about files that exist in training data but not on disk.
+    // Anti-hallucination: inject project context at the END of last user message.
+    // Model weights recent tokens highest. Appending to user's last turn makes
+    // this the most salient information — prevents trusting stale training data.
     const projectContext = buildProjectContext();
     if (projectContext) {
-      finalSystemMessage =
-        `${finalSystemMessage || ""}\n\n${projectContext}`.trim();
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg?.role === "user") {
+          if (typeof msg.content === "string") {
+            msg.content += "\n\n" + projectContext;
+          } else if (Array.isArray(msg.content)) {
+            // Append as text part to multimodal content
+            msg.content.push({ type: "text", text: "\n\n" + projectContext });
+          }
+          break;
+        }
+      }
     }
 
     // Сворачиваем историю, чтобы не превращать консоль в "потрошное месиво" при agent-loop (tool_calls)

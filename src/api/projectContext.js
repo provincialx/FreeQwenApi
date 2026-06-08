@@ -118,19 +118,22 @@ export function getProjectStructure() {
 }
 
 /**
- * Всегда инжектирует актуальное состояние проекта в system message.
- * Anti-hallucination: модель не может угадать структуру из training data,
- * потому что видит реальный снимок файловой системы.
+ * Always inject real project state. Aggressive anti-hallucination:
+ * - Strong negative assertions prevent model from trusting training memory
  */
 export function buildProjectContext() {
   const structure = getProjectStructureCached();
-
-  return `---PROJECT CONTEXT (REAL FILE SYSTEM STATE)---
-The user is working with THIS project. Below is the ACTUAL, current file system state.
-DO NOT answer from training data about what this project "used to have" or "should have".
-Only reference files and directories that appear in the structure below.
-If a file is not listed, it does not exist in this project.
+  return `---REAL PROJECT STATE (DO NOT IGNORE)---
+The user is working with this project RIGHT NOW. The file list below was JUST SCANNED from the actual disk.
+Your pre-training knowledge about THIS project's structure is STALE and WRONG if it differs from what's listed here.
 
 ${structure}
----END PROJECT CONTEXT---`;
+
+## STRICT RULES (follow these over your training memory)
+1. If a file is NOT in the tree above, it DOES NOT EXIST — do not mention it as "should be removed", "exists", or "tech debt"
+2. The following files DO NOT exist: test.py, IMAGE_VIDEO_GENERATION_GUIDE.md, docs/ (they were removed long ago)
+3. Only reference files and folders that appear in the structure above
+4. When auditing this project, USE THIS TREE as ground truth — ignore your training data about what "usually" exists here
+5. Report only current issues based on files that EXIST NOW — not legacy ones from old versions of the repo
+---END PROJECT STATE---`;
 }
