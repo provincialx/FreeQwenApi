@@ -304,3 +304,51 @@ export function setAuthenticationStatus(status) {
 export function getAuthenticationStatus() {
   return isAuthenticated;
 }
+
+// ─── Memory Guard: safe restart for active requests ─────────────────────────
+
+let _isRestarting = false;
+
+/**
+ * Returns true if a browser restart is currently in progress.
+ * Callers should wait or retry rather than starting a second restart.
+ */
+export function isBrowserRestarting() {
+  return _isRestarting;
+}
+
+/**
+ * Restarts Chromium when RSS exceeds threshold.
+ * Safe to call from within an active getPage() — the current request
+ * will fail gracefully and the caller should retry.
+ *
+ * Flow: save token → clear pool → shutdown → re-init headless.
+ * Uses a lock to prevent concurrent restarts.
+ */
+export async function restartBrowserIfLeaking(rssMb) {
+  if (_isRestarting) return false;
+  _isRestarting = true;
+
+  try {
+    logWarn(`🔥 Memory guard: RSS ${rssMb.toFixed(0)} MB — restarting Chromium...`);
+    const token = getAuthToken();
+    if (token) {
+      saveAuthToken(token);
+      await delay(500);
+    }
+    await shutdownBrowser();
+    await delay(RETRY_DELAY);
+    const success = await initBrowser(false, true);
+    if (success) {
+      logInfo(`✅ Chromium restarted successfully (was ${rssMb.toFixed(0)} MB)`);
+    } else {
+      logError("❌ Chromium restart failed after memory guard trigger");
+    }
+    return success;
+  } catch (error) {
+    logError("Ошибка при аварийном перезапуске браузера", error);
+    return false;
+  } finally {
+    _isRestarting = false;
+  }
+}

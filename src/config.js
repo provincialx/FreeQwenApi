@@ -64,3 +64,10 @@ export const LOG_MAX_FILES = Number(process.env.LOG_MAX_FILES) || 5;
 
 // Время ожидания ответа от модели Qwen в минутах (по умолчанию 3)
 export const REQUEST_TIMEOUT_MINUTES = Number(process.env.REQUEST_TIMEOUT_MINUTES) || 3;
+
+// ─── Memory Guard ─────────────────────────────────────────────────────────────
+// RSS threshold (MB) to trigger automatic Chromium restart.
+// Prevents OOM kills during long agent loops. Set 0 to disable.
+export const BROWSER_RESTART_RSS_MB = Number(process.env.BROWSER_RESTART_RSS_MB) || 512;
+// Check memory every N getPage() calls to avoid overhead on every request.
+export const MEMORY_CHECK_INTERVAL = Number(process.env.MEMORY_CHECK_INTERVAL) || 20;

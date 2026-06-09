@@ -1,4 +1,4 @@
-import { getBrowserContext } from "./browser.js";
+import { getBrowserContext, isBrowserRestarting, restartBrowserIfLeaking } from "./browser.js";
 import { saveAuthToken } from "./session.js";
 import { logWarn, logDebug, logInfo } from "../logger/index.js";
 import {
@@ -9,6 +9,8 @@ import {
   MAX_ACTIVE_PAGES,
   PAGE_IDLE_TTL_MS,
   PAGE_GC_INTERVAL_MS,
+  BROWSER_RESTART_RSS_MB,
+  MEMORY_CHECK_INTERVAL,
 } from "../config.js";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -82,6 +84,8 @@ export async function evaluateWithTimeout(page, fn, timeoutMs = EVALUATE_HEALTH_
  * - GC timer is started lazily on first getPage()/releasePage() to avoid
  *   keeping Node.js alive during unit tests that import this module transitively.
  */
+let _getPageCallCount = 0;
+
 const pagePool = {
   pages: [], // { page, lastUsed } entries
   maxSize: PAGE_POOL_SIZE,
@@ -103,6 +107,26 @@ const pagePool = {
    */
   async getPage(context) {
     this._ensureGC();
+
+    // ─── Memory Guard ──────────────────────────────────────────────────────
+    // Periodically check Node.js RSS. If Chromium has leaked past threshold,
+    // trigger a background restart. Current request will fail and caller retries.
+    if (BROWSER_RESTART_RSS_MB > 0) {
+      _getPageCallCount++;
+      if (_getPageCallCount % MEMORY_CHECK_INTERVAL === 0 && !isBrowserRestarting()) {
+        const rssMb = process.memoryUsage().rss / (1024 * 1024);
+        if (rssMb > BROWSER_RESTART_RSS_MB) {
+          logWarn(
+            `🔥 Memory guard: RSS ${rssMb.toFixed(0)} MB > ${BROWSER_RESTART_RSS_MB} MB — triggering restart`
+          );
+          // Fire-and-forget: restart runs async, current getPage throws below
+          restartBrowserIfLeaking(rssMb).catch((e) => logError("Memory guard restart failed", e));
+          throw new Error(
+            `Chromium restarting due to high memory (${rssMb.toFixed(0)} MB). Retry in a few seconds.`
+          );
+        }
+      }
+    }
 
     // Enforce hard limit on active pages
     while (this.activeCount >= MAX_ACTIVE_PAGES) {
