@@ -35,7 +35,12 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
       headless: !visibleMode,
       slowMo: visibleMode ? 30 : 0,
       executablePath: process.env.CHROME_PATH || undefined,
-      protocolTimeout: Number(process.env.PROTOCOL_TIMEOUT) || 600_000,
+      // Protocol timeout exceeds REQUEST_TIMEOUT by a buffer so CDP doesn't fire
+      // before the external request times out. Default: max(env, 8min). Keeping this <<
+      // prevents zombie promises from blocking page pool slots indefinitely.
+      protocolTimeout:
+        Number(process.env.PROTOCOL_TIMEOUT) ||
+        (Number(process.env.REQUEST_TIMEOUT_MINUTES) || 3 + 5) * 60_000,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
