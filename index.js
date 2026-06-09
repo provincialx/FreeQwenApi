@@ -95,9 +95,24 @@ app.use((err, req, res, next) => {
 process.on("SIGINT", handleShutdown);
 process.on("SIGTERM", handleShutdown);
 process.on("SIGHUP", handleShutdown);
-process.on("uncaughtException", async (error) => {
+let _shuttingDown = false;
+function safeShutdown() {
+  if (_shuttingDown) return; // prevent double-invocation from unhandledRejection + uncaughtException
+  _shuttingDown = true;
+  handleShutdown().catch(logError);
+}
+
+process.on("uncaughtException", (error) => {
   logError("Необработанное исключение", error);
-  await handleShutdown();
+  safeShutdown();
+});
+
+process.on("unhandledRejection", (reason) => {
+  logError(
+    "Unhandled promise rejection",
+    reason instanceof Error ? reason : new Error(String(reason))
+  );
+  safeShutdown();
 });
 
 async function handleShutdown() {
