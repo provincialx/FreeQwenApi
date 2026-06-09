@@ -54,6 +54,9 @@ import {
 // ─── Project Context (anti-hallucination) ───────────────────────────────────
 import { buildProjectContext } from "./projectContext.js";
 
+// ─── Request Timeout Wrapper ─────────────────────────────────────────────
+import { withRequestTimeout } from "./timeoutWrapper.js";
+
 // ─── Response Builders (streaming, tool calls SSE) ─────────────────────────
 import {
   buildOpenAIToolResponse,
@@ -424,8 +427,9 @@ router.post("/chat/completions", async (req, res) => {
             qwenTools,
             tool_choice,
             finalSystemMessage,
-            streamingCallback),
-      );
+            streamingCallback,
+          ),
+        );
 
         // Parse tool calls — always capture the parsed result for fallback use.
         // When Qwen returns text like "Привет" + {"tool_calls":[]}, we need
@@ -654,8 +658,9 @@ router.post("/chat/completions", async (req, res) => {
           null, // files
           qwenTools,
           tool_choice,
-          finalSystemMessage),
-    );
+          finalSystemMessage,
+        ),
+      );
 
       persistSessionState(
         result,
@@ -781,4 +786,3 @@ router.post("/chat/completions", async (req, res) => {
 // ─── Export ──────────────────────────────────────────────────────────────────
 
 export default router;
-
