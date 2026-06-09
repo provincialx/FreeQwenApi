@@ -172,6 +172,13 @@ function _repairTruncatedBraces(text) {
   return text + needed;
 }
 
+/** Strip trailing bracket garbage (]}] etc.) from text that Qwen outputs when aborting JSON. */
+function _stripTrailingBracketGarbage(text) {
+  // Remove trailing whitespace + unbalanced closing brackets
+  const stripped = text.replace(/[\s]*[}\]]+$/, "") || null;
+  return stripped?.trim() || null;
+}
+
 /**
  * Split Qwen mixed answer into user-visible reasoning text and service tool_calls.
  * Mirrors Python fork's parse_tool_call_parts for Zed Agent compatibility.
@@ -235,10 +242,9 @@ export function parseToolCallParts(content) {
             const parsed = JSON.parse(candidate);
             calls = _extractCallsFromParsed(parsed);
             if (calls && calls.length > 0) {
-              visible = text
-                .slice(0, jsonStart - 1)
-                .replace(/```(?:json)?\s*```/gi, "")
-                .trim();
+              visible = _stripTrailingBracketGarbage(
+                text.slice(0, jsonStart - 1).replace(/```(?:json)?\s*```/gi, "")
+              );
               return { visible: visible || null, calls };
             }
           } catch {}
@@ -253,20 +259,18 @@ export function parseToolCallParts(content) {
           const parsed = JSON.parse(repaired);
           calls = _extractCallsFromParsed(parsed);
           if (calls && calls.length > 0) {
-            visible = text
-              .slice(0, jsonStart - 1)
-              .replace(/```(?:json)?\s*```/gi, "")
-              .trim();
+            visible = _stripTrailingBracketGarbage(
+              text.slice(0, jsonStart - 1).replace(/```(?:json)?\s*```/gi, "")
+            );
             return { visible: visible || null, calls };
           }
         } catch {}
       }
 
       // Marker found but JSON unparseable — suppress leak
-      visible = text
-        .slice(0, jsonStart)
-        .replace(/```(?:json)?\s*```/gi, "")
-        .trim();
+      visible = _stripTrailingBracketGarbage(
+        text.slice(0, jsonStart).replace(/```(?:json)?\s*```/gi, "")
+      );
       return { visible: visible || null, calls: [] };
     }
   }
@@ -300,8 +304,10 @@ export function parseToolCallParts(content) {
     }
   }
 
-  // No tool_calls found — return full text as visible
-  return { visible: content.trim(), calls: null };
+  // No tool_calls found — return full text as visible, stripped of trailing bracket garbage.
+  // Qwen sometimes aborts mid-JSON generation and leaves trailing ]} artifacts that leak to Zed.
+  let visible = _stripTrailingBracketGarbage(content.trim());
+  return { visible: visible || null, calls: null };
 }
 
 // ─── Debug state ────────────────────────────────────────────────────────────

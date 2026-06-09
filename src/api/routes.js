@@ -543,27 +543,36 @@ router.post("/chat/completions", async (req, res) => {
           result.choices[0].message.content
         ) {
           // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком.
-          // When we parsed tool calls and got visible text (stripped of JSON marker),
-          // use that to prevent leaking {"tool_calls":[]} into the user-visible response.
           let content = result.choices[0].message.content;
           if (parts && typeof parts === "object" && parts.visible !== undefined) {
-            content =
+            // Use parsed visible text, or strip all JSON artifacts + trailing bracket garbage.
+            // When parseToolCallParts returns visible=null and calls=[]/null, Qwen output
+            // was purely tool-call junk — don't leak ]} to Zed. Skip sending chunk in that case.
+            const stripped =
               parts.visible ||
               String(content)
                 .replace(/{(?:"tool_calls|"tool_call)[^}]*}/g, "")
                 .trim(); // Strip JSON artifacts
+
+            if (stripped) {
+              content = stripped.replace(/\s*[}\]]+$/, "").trim(); // Layer 2: kill trailing ]}
+            } else {
+              logDebug("Content is pure tool-call artifact — skipping SSE chunk");
+            }
           }
-          logDebug(`JSON response content length: ${content.length}`);
-          if (typeof streamingCallback === "function") {
-            streamingCallback(content);
-          } else {
-            writeSse({
-              id: "chatcmpl-stream",
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: mappedModel || "qwen-max-latest",
-              choices: [{ index: 0, delta: { content }, finish_reason: null }],
-            });
+          if (content) {
+            logDebug(`JSON response content length: ${String(content).length}`);
+            if (typeof streamingCallback === "function") {
+              streamingCallback(content);
+            } else {
+              writeSse({
+                id: "chatcmpl-stream",
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: mappedModel || "qwen-max-latest",
+                choices: [{ index: 0, delta: { content }, finish_reason: null }],
+              });
+            }
           }
         } else {
           logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
@@ -665,14 +674,17 @@ router.post("/chat/completions", async (req, res) => {
         }
       }
 
-      // Use stripped content when we parsed tool call markers but got empty array
+      // Use stripped content when we parsed tool call markers.
+      // When visible=null and calls=[]/null, Qwen output was pure tool-call junk.
       let responseContent = result.choices?.[0]?.message?.content || "";
-      if (parts?.visible !== null && parts.visible !== undefined) {
-        responseContent =
+      if (parts && typeof parts === "object") {
+        const stripped =
           parts.visible ||
           String(responseContent)
             .replace(/{(?:"tool_calls|"tool_call)[^}]*}/g, "")
-            .trim(); // Strip JSON artifacts
+            .trim();
+
+        responseContent = stripped ? stripped.replace(/\s*[}\]]+$/, "").trim() : responseContent;
       }
 
       const openaiResponse = {

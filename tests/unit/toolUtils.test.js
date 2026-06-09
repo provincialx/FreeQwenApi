@@ -85,6 +85,25 @@ describe("toolUtils", () => {
       assert.equal(result.visible, "Just a plain text answer");
       assert.equal(result.calls, null);
     });
+
+    it("strips trailing bracket garbage from visible text", () => {
+      // Qwen outputs ]} when aborting JSON generation
+      const result = parseToolCallParts("I need to use a tool\n]");
+      assert.ok(result.visible);
+      assert.equal(result.visible, "I need to use a tool");
+    });
+
+    it("returns null visible for pure bracket garbage", () => {
+      const result = parseToolCallParts("]}\n");
+      assert.equal(result.visible, null);
+      assert.equal(result.calls, null);
+    });
+
+    it("strips trailing ]} after valid text + empty tool_calls", () => {
+      // Qwen: "Here is the answer.\n{tool_calls:[]}\n]"
+      const result = parseToolCallParts('Аудит проекта.\n{"tool_calls":[]}\n]');
+      assert.equal(result.visible, "Аудит проекта.");
+    });
   });
 
   describe("normalizeToolCalls", () => {
