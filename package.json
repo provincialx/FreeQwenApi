@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test": "echo \"Ошибка: тест не задан\" && exit 1",
+    "test": "node --test tests/unit/*.test.js",
     "auth": "node scripts/auth.js",
     "models:sync": "node scripts/sync_models.js",
     "smoke": "node scripts/smoke_test.js"
