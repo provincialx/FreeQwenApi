@@ -66,6 +66,9 @@ export function toolsToPrompt(tools) {
 Этот JSON будет перехвачен прокси и НЕ будет показан пользователю в чате.
 Формат строго такой, без markdown, без \`\`\` и без пояснений вокруг:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
+НИКОГДА не пиши намерение вызвать инструмент как видимый текст.
+НИКОГДА не пиши «Читаю», «Вызываю», «Использую tool», «Продолжаю аудит» или подобное повествование перед tool call.
+Либо ТОЛЬКО tool_calls JSON, либо ТОЛЬКО обычный текстовый ответ. Никогда оба вместе.
 После результата tool/function НЕ повторяй тот же самый tool call с теми же arguments.
 Если tool уже вернул Status: Completed — считай результат полученным, даже если вывод пустой.
 Если list_directory уже был выполнен для того же path — НЕ вызывай его снова; используй уже полученный результат.
@@ -381,9 +384,12 @@ You are in AGENT LOOP with tools. Your task is to EXECUTE actions, not explain t
 - AFTER receiving a tool result, DO NOT repeat the SAME tool call with the SAME arguments
 - If Status: Completed — consider the result received even if output is empty
 - Task COMPLETE → Write plain text answer with findings WITHOUT any JSON
+- NEVER output your intention to call a tool as visible text
+- NEVER write "Читаю", "Calling", "Using tool", "Continuing audit" or similar narration before a tool call
+- Either output ONLY the tool_calls JSON OR ONLY plain text answer. Never both.
 
-When you NEED to call another tool, add this minified JSON on LAST LINE (no markdown):
-{"tool_calls":[{"name":"<tool_name>","arguments":{}}]}
+When you NEED to call another tool, output ONLY this minified JSON (no surrounding text, no markdown):
+{"tool_calls":[{"name":"","arguments":{}}]}
 Available Zed tools:
 ${JSON.stringify(compact, null, 0)}`;
 }
