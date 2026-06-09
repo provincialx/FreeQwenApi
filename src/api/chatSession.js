@@ -499,6 +499,49 @@ setInterval(() => {
     }
   }
   if (cleaned > 0) {
-    logDebug(`Очищено ${cleaned} старых сессий`);
+    logDebug(`Очищено ${cleaned} старых сессий в sessionToChatMap`);
+  }
+
+  // Also clean modelDefaultChats — expire entries older than 24h that are no longer needed.
+  // modelDefaultChats checked on read but stale keys accumulate forever without this.
+  const dayAgo = now - 86400000;
+  let modelCleaned = 0;
+  for (const [key, value] of modelDefaultChats.entries()) {
+    if (value.timestamp < dayAgo) {
+      modelDefaultChats.delete(key);
+      modelCleaned++;
+    }
+  }
+
+  // Clean chatIdMap — cap at reasonable size. Evict oldest entries to prevent unbounded growth.
+  // Each entry is ~100 bytes; unlimited map grows with unique conversation IDs from OpenWebUI/Zed.
+  const MAX_CHAT_MAP_SIZE = 500;
+  if (chatIdMap.size > MAX_CHAT_MAP_SIZE) {
+    const toEvict = chatIdMap.size - Math.floor(MAX_CHAT_MAP_SIZE / 2);
+    let evicted = 0;
+    for (const key of chatIdMap.keys()) {
+      if (evicted >= toEvict) break;
+      chatIdMap.delete(key);
+      evicted++;
+    }
+    logDebug(
+      `chatIdMap GC: evicted ${evicted} entries, ${chatIdMap.size} remaining (cap ${MAX_CHAT_MAP_SIZE})`
+    );
+  }
+
+  // Also clean idempotency cache aggressively — 5s TTL means old keys are garbage.
+  let idemCleaned = 0;
+  for (const [k, v] of idempotencyCache.entries()) {
+    if (now - v.timestamp > IDEM_CACHE_TTL_MS) {
+      idempotencyCache.delete(k);
+      idemCleaned++;
+    }
+  }
+
+  const total = cleaned + modelCleaned + idemCleaned;
+  if (total > 0) {
+    logInfo(
+      `♻️ Cache GC: session=${cleaned}, modelDefault=${modelCleaned}, idempotency=${idemCleaned}`
+    );
   }
 }, 600000);
