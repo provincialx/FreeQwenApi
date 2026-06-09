@@ -1,30 +1,41 @@
-# Зависимости Node.js
+# Зависимости
 node_modules/
-package-lock.json
-yarn.lock
 
-# Данные сессии и кэш
-session/*
-.cache/
+# Сессии (cookies, tokens)
+session/
 
+# Логи
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
 
-# Служебные файлы
-.DS_Store
+# Загруженные файлы
+uploads/
+
+# Coverage reports
+coverage/
+
+# Environment (secrets)
 .env
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
 
-# Логи
-/logs/*
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# IDE / редакторы
+.idea/
+.vscode/
+*.swp
+*.swo
 
-# Файлы Python
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+nul
+
+# Legacy Python fork (deprecated)
 __pycache__/
 *.py[cod]
 *$py.class
@@ -33,14 +44,11 @@ venv/
 .env/
 .venv/
 
-# Файлы редакторов
-.idea/
-.vscode/
-*.swp
-*.swo 
+# Editor config — tracked but not built
+.zed/**
+!.zed/
 
+# Auth artifacts
 src/Authorization.txt
-nul
 accounts
 /freeqwenapi/*
-.zed/*

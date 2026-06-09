@@ -220,6 +220,23 @@ curl http://localhost:3264/api/status
 curl http://localhost:3264/api/models
 ```
 
+## Разработка
+
+**ESLint + Prettier** — установлен и настроен. Запуск перед коммитом:
+
+```bash
+npm run lint          # найти проблемы
+npm run lint:fix      # автофикс (где возможно)
+npm run format        # форматирование Prettier
+```
+
+**Тесты + покрытие:**
+
+```bash
+npm test              # юнит-тесты (43 теста, node:test)
+npm run test:cov      # тесты с coverage report (c8)
+```
+
 ## Документация
 
 - [docs/FORK_DEMO_QUICKSTART.md](docs/FORK_DEMO_QUICKSTART.md) — быстрый сценарий для демо.

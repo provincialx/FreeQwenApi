@@ -9,7 +9,12 @@
     "test": "node --test --test-force-exit tests/unit/*.test.js",
     "auth": "node scripts/auth.js",
     "models:sync": "node scripts/sync_models.js",
-    "smoke": "node scripts/smoke_test.js"
+    "smoke": "node scripts/smoke_test.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write \"src/**/*.js\" index.js scripts/**/*.js tests/**/*.js",
+    "format:check": "prettier --check \"src/**/*.js\" index.js scripts/**/*.js tests/**/*.js",
+    "test:cov": "c8 node --test --test-force-exit tests/unit/*.test.js"
   },
   "dependencies": {
     "ali-oss": "^6.18.0",
@@ -26,5 +31,12 @@
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "c8": "^11.0.0",
+    "eslint": "^10.4.1",
+    "globals": "^17.6.0",
+    "prettier": "^3.8.3"
   }
 }
