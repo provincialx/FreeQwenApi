@@ -6,8 +6,15 @@ Do not use regex!
 - При аудите всегда начинай с list_directory и read_file.
 - Если пользователь спрашивает «есть ли файл X?» — вызови list_directory, а не отвечай из контекста.
 
-Read full documents at the entrance .md and update any changes.
-Commit any changes and push to the repository.
+## Documentation Sync
+- При любом изменении в core-логике (routes, qwenApi, toolUtils, browser, pagePool, config) — обновить соответствующий файл в `docs/`:
+  - Архитектура/потоки → `docs/02_ARCHITECTURE.md`
+  - Модули/интерфейсы → `docs/03_CODE_MAP.md`
+  - Статус/стабильность → `docs/01_STATUS.md`
+  - История изменений → `docs/05_CHANGELOG.md`
+  - Новые вопросы/debt → `docs/06_OPEN_QUESTIONS.md`
+- Коммитить документацию вместе с кодом в одном коммите.
+- Push to the repository after committing.
 
 # FreeQwenApi — Rules for AI Assistant
 
