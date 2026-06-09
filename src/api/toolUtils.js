@@ -189,11 +189,8 @@ export function parseToolCallParts(content) {
 
   let text = content.trim();
 
-  // Debug trace
+  // Debug trace (silent in production — use lastRawContentForDebug.value for inspection)
   lastRawContentForDebug.value = text.substring(0, 300);
-  console.log(
-    `[TOOL_PARSE] len=${text.length} first=${JSON.stringify(text.substring(0, 150))}`, // eslint-disable-line no-console -- debug
-  );
 
   // Strip full-fence markdown if entire response is fenced JSON
   const fence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
@@ -208,9 +205,6 @@ export function parseToolCallParts(content) {
   try {
     const parsed = JSON.parse(text);
     const calls = _extractCallsFromParsed(parsed, true);
-    console.log(
-      `[TOOL_PARSE] step1=ok calls=${calls?.length || 0}`, // eslint-disable-line no-console -- debug
-    );
     if (calls && calls.length > 0) return { visible: "", calls: calls };
   } catch {}
 
@@ -281,9 +275,6 @@ export function parseToolCallParts(content) {
         .slice(0, jsonStart)
         .replace(/```(?:json)?\s*```/gi, "")
         .trim();
-      console.log(
-        `[TOOL_PARSE] step2=fail (unparseable) marker@${markerPos} jsonStart=${jsonStart}`, // eslint-disable-line no-console -- debug
-      );
       return { visible: visible || null, calls: [] };
     }
   }
@@ -321,9 +312,6 @@ export function parseToolCallParts(content) {
   }
 
   // No tool_calls found — return full text as visible
-  console.log(
-    `[TOOL_PARSE] fallback=visible no-tool-calls-found`, // eslint-disable-line no-console -- debug
-  );
   return { visible: content.trim(), calls: null };
 }
 

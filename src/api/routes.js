@@ -430,9 +430,6 @@ router.post("/chat/completions", async (req, res) => {
         if (captureToolCalls) {
           parts = parseToolCallParts(result?.choices?.[0]?.message?.content);
           const rawCalls = parts.calls || [];
-          logInfo(
-            `🔍 Parse result: calls=${rawCalls.length}, visible_len=${parts.visible ? String(parts.visible).length : 0}`,
-          );
           const toolCalls = normalizeToolCalls(rawCalls);
 
           // Anti-loop: detect repeated/blocked tool calls (from Python fork)
