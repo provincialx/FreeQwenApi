@@ -396,6 +396,7 @@ router.post("/chat/completions", async (req, res) => {
         // parts.visible (stripped of JSON marker) instead of raw content.
         let parts = null;
         if (captureToolCalls) {
+          streamingCallback = null; // Force non-streaming — atomic tool_call parsing
           parts = parseToolCallParts(result?.choices?.[0]?.message?.content);
           const rawCalls = parts.calls || [];
           const toolCalls = normalizeToolCalls(rawCalls);
@@ -546,7 +547,11 @@ router.post("/chat/completions", async (req, res) => {
           // use that to prevent leaking {"tool_calls":[]} into the user-visible response.
           let content = result.choices[0].message.content;
           if (parts && typeof parts === "object" && parts.visible !== undefined) {
-            content = parts.visible || content;
+            content =
+              parts.visible ||
+              String(content)
+                .replace(/{(?:"tool_calls|"tool_call)[^}]*}/g, "")
+                .trim(); // Strip JSON artifacts
           }
           logDebug(`JSON response content length: ${content.length}`);
           if (typeof streamingCallback === "function") {
@@ -663,7 +668,11 @@ router.post("/chat/completions", async (req, res) => {
       // Use stripped content when we parsed tool call markers but got empty array
       let responseContent = result.choices?.[0]?.message?.content || "";
       if (parts?.visible !== null && parts.visible !== undefined) {
-        responseContent = parts.visible || responseContent;
+        responseContent =
+          parts.visible ||
+          String(responseContent)
+            .replace(/{(?:"tool_calls|"tool_call)[^}]*}/g, "")
+            .trim(); // Strip JSON artifacts
       }
 
       const openaiResponse = {
