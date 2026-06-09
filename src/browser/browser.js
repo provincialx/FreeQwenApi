@@ -1,4 +1,5 @@
 import puppeteer from "puppeteer-extra";
+import { safeClosePage } from "./pagePool.js";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { saveSession, saveAuthToken } from "./session.js";
 import { startManualAuthentication } from "./auth.js";
@@ -281,7 +282,7 @@ export async function shutdownBrowser() {
     if (browserInstance) {
       try {
         const pages = await browserInstance.pages();
-        for (const page of pages) await page.close().catch(() => {});
+        for (const page of pages) await safeClosePage(page);
         await browserInstance.close();
       } catch (e) {
         logError("Ошибка при закрытии браузера", e);

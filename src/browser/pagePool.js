@@ -15,6 +15,23 @@ import {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+
+/**
+ * Safely closes a Puppeteer page, suppressing "Target closed" errors.
+ * These occur when the CDP target is already gone (browser shutdown, crashed tab).
+ */
+export async function safeClosePage(page) {
+  try {
+    if (page && !page.isClosed()) {
+      await safeClosePage(page);
+    }
+  } catch (e) {
+    const msg = e?.message || "";
+    if (/target closed|session closed|protocol error/i.test(msg)) return;
+    logDebug(`safeClosePage: suppressed error: ${msg.substring(0, 80)}`);
+  }
+}
+
 // ─── Page creation helper ────────────────────────────────────────────────────
 
 /**
@@ -156,7 +173,7 @@ const pagePool = {
         logWarn(`Страница из пула протухла (${e.message?.substring(0, 60)}), создаём новую`);
         if (page !== baseContext) {
           try {
-            await page.close();
+            await safeClosePage(page);
           } catch {
             /* already dead */
           }
@@ -226,7 +243,7 @@ const pagePool = {
     if (this.pages.length < this.maxSize) {
       this.pages.push({ page, lastUsed: Date.now() });
     } else {
-      import("../logger/index.js").then(({ logError }) => page.close().catch(logError));
+      safeClosePage(page);
     }
   },
 
@@ -238,7 +255,7 @@ const pagePool = {
     for (const entry of this.pages) {
       if (entry.page === baseContext) continue;
       try {
-        await entry.page.close();
+        await safeClosePage(entry.page);
       } catch {
         /* ignore close errors during cleanup */
       }
@@ -261,7 +278,7 @@ const pagePool = {
       const idle = now - entry.lastUsed;
       if (idle > PAGE_IDLE_TTL_MS) {
         if (entry.page !== baseContext) {
-          entry.page.close().catch(() => {});
+          safeClosePage(entry.page);
           logDebug(`🗑 GC: closed idle page (idle ${Math.round(idle / 1000)}s)`);
         }
       } else {
