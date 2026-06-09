@@ -91,6 +91,8 @@ export async function evaluateWithTimeout(
  * - Hard limit on total active pages (MAX_ACTIVE_PAGES) prevents unbounded growth.
  * - Periodic GC closes idle pages older than PAGE_IDLE_TTL_MS.
  * - Each pooled page tracks lastUsed timestamp for TTL-based eviction.
+ * - GC timer is started lazily on first getPage()/releasePage() to avoid
+ *   keeping Node.js alive during unit tests that import this module transitively.
  */
 const pagePool = {
   pages: [], // { page, lastUsed } entries
@@ -99,12 +101,21 @@ const pagePool = {
   _gcTimer: null,
 
   /**
+   * Ensures GC timer is running. Called lazily from getPage/releasePage.
+   */
+  _ensureGC() {
+    if (!this._gcTimer) this.startGC();
+  },
+
+  /**
    * Acquires a working page from the pool or creates a new one.
    * Health-checks pooled pages; drops dead ones and creates fresh tabs on failure.
    * Retry goto up to 3 times with exponential backoff on network errors.
    * Blocks if MAX_ACTIVE_PAGES reached until a page is returned.
    */
   async getPage(context) {
+    this._ensureGC();
+
     // Enforce hard limit on active pages
     while (this.activeCount >= MAX_ACTIVE_PAGES) {
       logWarn(
@@ -191,6 +202,7 @@ const pagePool = {
    * Tracks lastUsed timestamp for TTL-based GC.
    */
   releasePage(page) {
+    this._ensureGC();
     this.activeCount = Math.max(0, this.activeCount - 1);
 
     try {
@@ -233,7 +245,7 @@ const pagePool = {
 
   /**
    * Periodic GC: closes pooled pages idle longer than PAGE_IDLE_TTL_MS.
-   * Runs every PAGE_GC_INTERVAL_MS. Started lazily on first getPage/releasePage.
+   * Runs every PAGE_GC_INTERVAL_MS.
    */
   _runGC() {
     const now = Date.now();
@@ -302,8 +314,9 @@ const pagePool = {
   },
 };
 
-// Auto-start GC on module load
-pagePool.startGC();
+// GC is started lazily on first getPage() or releasePage() call.
+// This prevents the setInterval from keeping Node.js alive during unit tests
+// that import modules which transitively import pagePool.
 
 export { pagePool };
 

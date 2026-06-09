@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test tests/unit/*.test.js",
+    "test": "node --test --test-force-exit tests/unit/*.test.js",
     "auth": "node scripts/auth.js",
     "models:sync": "node scripts/sync_models.js",
     "smoke": "node scripts/smoke_test.js"
