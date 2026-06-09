@@ -84,27 +84,64 @@ export function writeToolCallsSse(
   }
 
   for (const call of toolCalls) {
-    const chunk = JSON.stringify({
-      ...base,
-      choices: [
-        {
-          index: 0,
-          delta: {
-            tool_calls: [
+    // Send function metadata first, then arguments in chunks to prevent
+    // oversized SSE data lines that Zed Agent may truncate.
+    // This matches OpenAI's incremental tool_call streaming behavior.
+    const args =
+      typeof call.function?.arguments === "string"
+        ? call.function.arguments
+        : JSON.stringify(call.function?.arguments || {});
+
+    // Chunk 1: id + type + name (always small)
+    res.write(
+      "data: " +
+        JSON.stringify({
+          ...base,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: call.index,
+                    id: call.id,
+                    type: call.type || "function",
+                    function: { name: call.function?.name },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }) +
+        "\n\n",
+    );
+
+    // Chunks 2+: arguments delivered in segments (max ~500 chars per chunk)
+    const ARG_CHUNK = 500;
+    for (let i = 0; i < args.length; i += ARG_CHUNK) {
+      res.write(
+        "data: " +
+          JSON.stringify({
+            ...base,
+            choices: [
               {
-                index: call.index,
-                id: call.id,
-                type: "function",
-                function: call.function,
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: call.index,
+                      function: { arguments: args.slice(i, i + ARG_CHUNK) },
+                    },
+                  ],
+                },
+                finish_reason: null,
               },
             ],
-          },
-          finish_reason: null,
-        },
-      ],
-    });
-    logDebug(`🔨 SSE tool_call chunk: ${chunk}`);
-    res.write("data: " + chunk + "\n\n");
+          }) +
+          "\n\n",
+      );
+    }
   }
   res.write(
     "data: " +
