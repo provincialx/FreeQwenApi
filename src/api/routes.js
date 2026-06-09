@@ -377,6 +377,14 @@ router.post("/chat/completions", async (req, res) => {
           return;
         }
 
+        // Agent-loop cooldown: when Zed sends tool results immediately after receiving
+        // tool_calls, Qwen SSE session may still be processing. Small delay avoids
+        // "chat is in progress" errors that force context-destroying new-chat creation.
+        if (inAgentLoop && qwenChatId) {
+          logDebug("🔄 Agent-loop cooldown: waiting 1s for Qwen SSE session to settle");
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+
         const result = await withRequestTimeout(
           sendMessage(
             messageContent,
@@ -608,6 +616,13 @@ router.post("/chat/completions", async (req, res) => {
       }
     } else {
       const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+
+      // Agent-loop cooldown: same as streaming path above.
+      if (inAgentLoop && qwenChatId) {
+        logDebug("🔄 Agent-loop cooldown (non-stream): waiting 1s for Qwen SSE session to settle");
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+
       const result = await withRequestTimeout(
         sendMessage(
           messageContent,

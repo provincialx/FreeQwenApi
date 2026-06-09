@@ -812,28 +812,55 @@ export async function sendMessage(
         }
       }
 
-      // Handle Qwen API error: "The chat is in progress!" -> create new chat and retry once
-      if (response.errorBody && /chat is in progress/i.test(response.errorBody)) {
-        logWarn(
-          `Qwen чат ${chatId} заблокирован ("in progress"). Создаю новый и повторяю запрос...`
-        );
-        const newChatResult = await createChatV2(model, "Сессия", 0);
-        if (newChatResult && newChatResult.chatId) {
-          // Reset parentId — old parent message doesn't exist in the new chat.
+      // Handle Qwen API error: "The chat is in progress!" -> wait and retry SAME chat.
+      // Creating a new chat during agent-loop destroys context — Qwen loses
+      // assistant.tool_calls history and generates explanatory text instead of continuation.
+      // Only escalate to new-chat if same-chat retries exhaust (Qwen truly stuck).
+      const isInProgress = response.errorBody && /chat is in progress/i.test(response.errorBody);
+      if (isInProgress) {
+        if (retryCount < 3) {
+          // Backoff: ~2s, ~4s — Qwen SSE session usually finishes in 1-5s after
+          // we receive the last chunk. Shorter than normal retry to avoid blocking agent-loop.
+          const waitMs = Math.min(1000 * (retryCount + 2), RETRY_DELAY);
+          logWarn(
+            `Qwen чат ${chatId} заблокирован ("in progress"). Ожидание ${waitMs}мс перед повтором на том же чате...`
+          );
+          await delay(waitMs);
           const retryResult = await sendMessage(
             message,
             model,
-            newChatResult.chatId,
-            null, // parentId: reset for new chat
+            chatId, // keep same chat — preserve assistant.tool_calls context
+            parentId, // keep same parentId — continue conversation thread
             files,
             tools,
             toolChoice,
             systemMessage,
-            1,
+            retryCount + 1,
             onChunk
           );
-          if (!retryResult.error) retryResult.newChatId = newChatResult.chatId;
           return retryResult;
+        } else {
+          logWarn(
+            `Qwen чат ${chatId} заблокирован ("in progress") после ${retryCount} попыток. Создаю новый чат...`
+          );
+          const newChatResult = await createChatV2(model, "Сессия", 0);
+          if (newChatResult && newChatResult.chatId) {
+            // Reset parentId — old parent message doesn't exist in the new chat.
+            const retryResult = await sendMessage(
+              message,
+              model,
+              newChatResult.chatId,
+              null, // parentId: reset for new chat
+              files,
+              tools,
+              toolChoice,
+              systemMessage,
+              10, // hard-stop — prevent infinite loop even if new chat also "in progress"
+              onChunk
+            );
+            if (!retryResult.error) retryResult.newChatId = newChatResult.chatId;
+            return retryResult;
+          }
         }
       }
 
