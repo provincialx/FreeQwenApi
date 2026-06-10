@@ -116,8 +116,8 @@ Full technical documentation on architecture, module structure, and change histo
 - [docs/01_STATUS.md](docs/01_STATUS.md) — current system stability status
 - [docs/02_ARCHITECTURE.md](docs/02_ARCHITECTURE.md) — data flow diagrams (normal request vs agent-loop + race condition fix)
 - [docs/03_CODE_MAP.md](docs/03_CODE_MAP.md) — module map, key interfaces, and config constants
-- [docs/05_CHANGELOG.md](docs/05_CHANGELOG.md) — full development history (sessions 1–42)
-- [docs/06_OPEN_QUESTIONS.md](docs/06_OPEN_QUESTIONS.md) — open issues, known quirks, and constraints
+- [docs/04_CHANGELOG.md](docs/04_CHANGELOG.md) — full development history (sessions 1–48)
+- [docs/05_OPEN_QUESTIONS.md](docs/05_OPEN_QUESTIONS.md) — open issues, known quirks, and constraints
 
 ## Support the Author
 

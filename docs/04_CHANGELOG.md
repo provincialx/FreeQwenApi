@@ -1,0 +1,20 @@
+# 05 — Changelog
+
+## Recent stabilization (Sessions 34–48, June 7–10)
+
+| S | Title | Fix | Files changed |
+|---|-------|-----|---------------|
+| 34 | handleApiError warn spam | Extended error check to include `.status || .errorBody`. Moved `logError` from handler to caller — only logs after retries exhausted. | qwenApi.js, routes.js |
+| 35–36 | ESLint + Prettier setup | Flat config with Node+browser globals. Fixed modelMapping duplicate keys bug found by linter. Formatted all files. Added c8 coverage support. | eslint.config.js, .prettierrc, package.json |
+| 37 | Tool call delivery reliability | Explicit `streamingCallback = null` guard in captureToolCalls block. Regex-strip JSON markers from visible text before SSE/JSON delivery. | routes.js |
+| 38 | Strip bracket garbage | `_stripTrailingBracketGarbage()` trims trailing `[}\]]+` at all parse exit points. Final sanitization before SSE delivery skips empty chunks. | toolUtils.js |
+| 39 | Anti-loop cooldown | 1s delay between agent-loop iterations prevents tight retry storms. | routes.js |
+| 40 | Session GC + idempotency cache | Periodic cleanup of stale session maps (>24h), chatIdMap (>500 entries), idempotency cache (>1000 entries or >5s TTL). Prevents unbounded memory growth. | chatSession.js |
+| 41 | Protocol timeout alignment | `protocolTimeout` set to 8min (> REQUEST_TIMEOUT_MINUTES=3m) so Puppeteer CDP doesn't kill connection before our wrapper fires. | browser.js |
+| 42 | "chat is in progress" same-chat retry | Backoff retry (2s → 4s) to SAME chat instead of creating new one. Preserves tool-calling context continuity across agent-loop iterations. Only escalates to new-chat fallback after 3 failed attempts. | qwenApi.js |
+| 43 | parseNonSseCompletionBody shared parser | Extracted non-SSE response parsing into dedicated function. Detects Qwen `ret[]` errors, HTTP codes, and captcha/overload signals in JSON bodies returned with 200 status. | qwenApi.js |
+| 44 | Non-SSE error classification | parseNonSseCompletionBody detects Qwen `ret[]` errors (e.g. FAIL_SYS_USER_VALIDATE) as HTTP 503. Removed duplicated inline parsing in executeApiRequest — now delegates to shared parser. handleApiError retries with backoff (5s → 10s per attempt). Added tools/toolChoice/systemMessage to handleApiError signature so full context preserved on retry. | qwenApi.js, ARCHITECTURE.md, CODE_MAP.md |
+| 45 | safeClosePage recursion fix | `safeClosePage()` called itself recursively instead of `page.close()`, causing `RangeError: Maximum call stack size exceeded` on every page close (GC, cleanup, restart). Fixed to call `page.close()` directly. | pagePool.js |
+| 46 | Stale chat resolution after restart | `resolveQwenChatId` creates new chat when no default exists for model (instead of returning null). `invalidateQwenChatId` cleans ALL maps (chatIdMap, modelDefaultChats, sessionToChatMap) on "not exist" error to prevent stale references after bulk delete or cache expiry. | chatSession.js |
+| 47 | CAPTCHA isCaptcha flag propagation | Added `isCaptcha` boolean to all error return paths in qwenApi.js for reliable CAPTCHA detection upstream. Previously only some paths set the flag, causing missed CAPTCHA challenges. | qwenApi.js |
+| 48 | CAPTCHA resolver + stream hang prevention | Qwen added slider CAPTCHA (`FAIL_SYS_USER_VALIDATE`) that returns HTTP 200 with JSON error but claims `text/event-stream` content-type. Reader would hang for 60s blocking CDP, deadlocking page pool. Fixed: (1) `resolveCaptchaChallenge()` in auth.js — restarts Chromium headed when CAPTCHA detected, waits for user to solve slider + press Enter, saves token/session, restarts headless and retries request. Protected by `_captchaResolverRunning` loop guard. (2) All SSE reader loops now use `Promise.race(reader.read(), timeout)` with 5s first-chunk deadline. If no chunk arrives → falls back to body parse as JSON error → status 503. | qwenApi.js, auth.js |

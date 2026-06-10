@@ -13,18 +13,18 @@ src/
 │
 ├── api/                            # API layer — OpenAI-compatible endpoints + Qwen interaction
 │   ├── routes.js                   # Main route handler. chatId resolution, streaming/non-streaming paths
-│   ├── chatSession.js              # Chat ID map/model defaults, session persistence, force-folding logic
-│   ├── openaiUtils.js              # Message parsing/normalization, tool state detection, folding helpers
+│   ├── chatSession.js              # Chat ID map/model defaults, session persistence, folding trigger
+│   ├── openaiUtils.js              # Message parsing/normalization, tool state detection, folding helpers (buildStatelessTranscript)
 │   ├── responseBuilders.js         # SSE chunk construction: tool_call delivery, streaming fallback
 │   ├── qwenApi.js                  # Qwen API interaction: sendMessage, retry policy, error handling
 │   │   ├── buildPayloadV2() — construct /api/v2/chat/completions payload
-│   │   │   ├── parseNonSseCompletionBody() — detect ret[], code, captcha/overload in non-SSE 200 responses (S43)
-│   │   │   ├── executeApiRequest() — browser.evaluate fetch with reader timeout guard against stream hangs (S48)
-│   │   │   └── handleApiError() — classify & route errors to retry paths
-│   │   │       ├─ 401 → rotate token, retry
-│   │   │       ├─ 429 RateLimited → mark rate-limited, try next token
-│   │   │       ├─ 503 overload/CAPTCHA → trigger resolveCaptchaChallenge or backoff retry (S48)
-│   │   │       └─ generic → return error with details
+│   │   ├── parseNonSseCompletionBody() — detect ret[], code, captcha/overload in non-SSE 200 responses (S43)
+│   │   ├── executeApiRequest() — browser.evaluate fetch with reader timeout guard against stream hangs (S48)
+│   │   └── handleApiError() — classify & route errors to retry paths
+│   │       ├─ 401 → rotate token, retry
+│   │       ├─ 429 RateLimited → mark rate-limited, try next token
+│   │       ├─ 503 overload/CAPTCHA → trigger resolveCaptchaChallenge or backoff retry (S48)
+│   │       └─ generic → return error with details
 │   ├── chat.js                     # Token state + model/key loaders. Re-exports from qwenApi.js, pagePool.js
 │   ├── toolUtils.js                # Tool prompt injection & parseToolCallParts (JSON extraction)
 │   │   ├── toolsToPrompt() / toolsToLightPrompt() — full vs compact schema injection
@@ -42,6 +42,7 @@ src/
 │   ├── pagePool.js                 # Page pool: health-check checkout/release, idle TTL GC (S31)
 │   │   ├── getPage() — acquire page from pool with evaluate timeout health check
 │   │   ├── releasePage() — return to pool or close if invalid
+│   │   ├── safeClosePage() — suppress Target closed errors on page.close() (S45)
 │   │   └── _runGC() / _ensureGC() — lazy-started periodic GC at PAGE_GC_INTERVAL_MS (S31)
 │   ├── auth.js                     # Auth verification + CAPTCHA resolution
 │   │   ├── checkAuthentication() — detect login needed, extract token after manual auth
@@ -153,9 +154,9 @@ flowchart LR
 |------|-----|-------|
 | routes.js | ~1030 | Main handler. Grew with agent-loop logic (S22, S42). Refactored from 2390 → current via S11-14 splits. |
 | qwenApi.js | ~1400 | Qwen API interaction: sendMessage, createChatV2, executeApiRequest variants |
-| chatSession.js | ~540 | Chat ID resolution/generation/normalization, session persistence, force-folding |
-| pagePool.js | ~290 | Page lifecycle with health checks + GC timer (S13, S31) |
-| openaiUtils.js | ~400 | Message parsing, tool state detection, compact builder port from Python fork (S23) |
+| chatSession.js | ~540 | Chat ID resolution/generation/normalization, session persistence, folding trigger |
+| pagePool.js | ~290 | Page lifecycle with health checks + GC timer (S13, S31, S45) |
+| openaiUtils.js | ~400 | Message parsing, tool state detection, buildStatelessTranscript, compact builder port from Python fork (S23) |
 | responseBuilders.js | ~260 | buildOpenAIToolResponse, writeToolCallsSse with chunk splitting (S29) |
 | toolUtils.js | ~500 | Prompt injection, parseToolCallParts (brace repair), anti-loop detection |
 | chat.js | ~180 | Token state wrapper + model/key loaders. Grew thin after S14 split. |

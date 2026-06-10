@@ -117,8 +117,8 @@ Zed Agent может вызывать внешние инструменты по
 - [docs/01_STATUS.md](docs/01_STATUS.md) — текущий статус стабильности системы
 - [docs/02_ARCHITECTURE.md](docs/02_ARCHITECTURE.md) — диаграммы потоков данных (нормальный запрос vs agent-loop + race condition fix)
 - [docs/03_CODE_MAP.md](docs/03_CODE_MAP.md) — карта модулей, ключевые интерфейсы и константы конфигурации
-- [docs/05_CHANGELOG.md](docs/05_CHANGELOG.md) — полная история развития (сессии 1–42)
-- [docs/06_OPEN_QUESTIONS.md](docs/06_OPEN_QUESTIONS.md) — открытые задачи, известные quirks и ограничения
+- [docs/04_CHANGELOG.md](docs/04_CHANGELOG.md) — полная история развития (сессии 1–48)
+- [docs/05_OPEN_QUESTIONS.md](docs/05_OPEN_QUESTIONS.md) — открытые задачи, известные quirks и ограничения
 
 ## Поддержать автора
 

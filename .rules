@@ -9,8 +9,8 @@
   - Architecture/flows → `docs/02_ARCHITECTURE.md`
   - Modules/interfaces → `docs/03_CODE_MAP.md`
   - Status/stability → `docs/01_STATUS.md`
-  - Change history → `docs/05_CHANGELOG.md`
-  - New questions/debt → `docs/06_OPEN_QUESTIONS.md`
+  - Change history → `docs/04_CHANGELOG.md`
+  - New questions/debt → `docs/05_OPEN_QUESTIONS.md`
 - Commit documentation together with code in a single commit.
 - Push to the repository after committing.
 

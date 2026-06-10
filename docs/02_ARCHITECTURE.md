@@ -152,11 +152,6 @@ flowchart TD
     F -->|yes| G[create new Qwen chat<br/>via createChatV2]
     G --> H[map to effectiveChatId +<br/>save as model default]
     F -->|no| I[qwenChatId = null → sendMessage<br/>auto-creates chat at bottom]
-
-    style C fill:#d4edda
-    style E fill:#fff3cd
-    style H fill:#cfe2ff
-    style I fill:#f8d7da
 ```
 
 ## Error retry policy
@@ -164,8 +159,7 @@ flowchart TD
 | Error type | Strategy | Preserves parentId? | Preserves chatId? | Max attempts |
 |---|---|---|---|---|
 | `parent_id.*not exist` | Retry same chat, reset parentId to null | No (null) | Yes | 1 |
-| `chat_not_exist` / `/not exist/i` | Create new chat via createChatV2, parentId=null | No (null) | No (new) | 1 |
-| HTTP 503 overload/CAPTCHA | Backoff retry (5s → 10s per attempt), same chat+parentId | Yes | Yes | MAX_RETRY_COUNT |
+| `chat_not_exist` / `/not exist/i` | Create new chat via createChatV2 **with same token**, parentId=null, gated by `retryCount === 0` | No (null) | No (new) | 1 |
 | `"chat is in progress"` | Wait + retry **same** chat with same parentId | Yes | Yes | 3, then escalate to new-chat fallback |
 | `FAIL_SYS_USER_VALIDATE` (CAPTCHA) | Show visible browser, wait for user Enter, restart headless, retry same request preserving parentId + chatId | Yes | Yes | 2 |
 
