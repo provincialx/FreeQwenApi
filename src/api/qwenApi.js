@@ -82,28 +82,14 @@ async function resolveCaptchaAndRetry(
   try {
     logInfo("Перезапуск браузера в видимом режиме для CAPTCHA...");
 
-    // Save token BEFORE shutdown — it will be lost when we create a new browser.
-    const savedToken = getAuthToken();
-    if (!savedToken) {
-      console.log("ОШИБКА: Токен авторизации отсутствует, невозможно восстановить сессию");
-      return sendMessage(
-        messageContent,
-        model,
-        chatId,
-        parentId,
-        files,
-        tools,
-        toolChoice,
-        systemMessage,
-        retryCount + 1,
-        onChunk
-      );
-    }
+    // Save cookies BEFORE shutdown — Puppeteer can restore them in new instance.
+    const savedCookies = await _browserContext.cookies();
+    logInfo(`Сохранено ${savedCookies.length} куков перед перезапуском`);
 
     // Shutdown headless and start visible browser WITHOUT manual auth prompt.
     await shutdownBrowser();
     await delay(2000);
-    await initBrowser(true, true); // visible = true, skipManualAuth = true
+    await initBrowser(true, true); // visible + skipManualAuth
     const visibleContext = getBrowserContext();
 
     if (!visibleContext) {
@@ -122,27 +108,28 @@ async function resolveCaptchaAndRetry(
       );
     }
 
-    // Open CAPTCHA page.
-    const captchaPage = await pagePool.getPage(visibleContext);
+    // Restore cookies to the new browser context.
+    if (savedCookies.length > 0) {
+      logInfo(`Восстановление ${savedCookies.length} куков в видимом браузере...`);
+      await visibleContext.setCookie(...savedCookies);
+      const restored = await visibleContext.cookies();
+      logInfo(`Куки восстановлены (${restored.length})`);
+    }
 
+    // Open CAPTCHA page and verify auth.
+    const captchaPage = await pagePool.getPage(visibleContext);
     try {
       await captchaPage.goto(CHAT_PAGE_URL, {
         waitUntil: "domcontentloaded",
         timeout: PAGE_TIMEOUT,
       });
 
-      // Inject saved token into localStorage so the user appears logged in.
-      const currentToken = await captchaPage.evaluate((t) => {
-        localStorage.setItem("token", t);
-        return localStorage.getItem("token");
-      }, savedToken);
-
-      logInfo(`Токен восстановлен в localStorage: ${String(currentToken).substring(0, 20)}...`);
-
-      // Wait for Qwen to process the token - page might redirect or update.
-      await delay(2000);
+      // Check if token is present in localStorage after cookie restore.
+      const hasToken = await captchaPage.evaluate(() => !!localStorage.getItem("token"));
+      if (hasToken) logInfo("Сессия восстановлена — пользователь авторизован");
+      else logWarn("Токен не найден в localStorage после восстановления куков");
     } catch (e) {
-      logWarn(`Не удалось загрузить страницу CAPTCHA или восстановить токен: ${e.message}`);
+      logWarn(`Не удалось загрузить страницу CAPTCHA: ${e.message}`);
     }
 
     console.log("\nПосле прохождения CAPTCHA нажмите ENTER...");
@@ -158,15 +145,15 @@ async function resolveCaptchaAndRetry(
     });
 
     console.log("CAPTCHA подтверждена, обновляю сессию...");
-    await delay(3000); // Give Qwen time to register the solved captcha and update token.
+    await delay(3000); // Give Qwen time to register the solved captcha.
 
-    // Re-extract auth token from browser after CAPTCHA solved - it might be rotated.
+    // Re-extract auth token — it might be rotated after CAPTCHA resolution.
     const newToken =
       (await captchaPage.evaluate(() => localStorage.getItem("token"))) || getAuthToken();
     if (newToken) {
       setAuthToken(newToken);
       saveAuthToken(newToken);
-      logInfo(`Токен обновлён после CAPTCHA: ${String(newToken).substring(0, 20)}...`);
+      logInfo(`Токен обновлён после CAPTCHA`);
     }
 
     pagePool.releasePage(captchaPage);
