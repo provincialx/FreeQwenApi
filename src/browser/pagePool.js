@@ -77,10 +77,25 @@ export const EVALUATE_HEALTH_TIMEOUT = Number(process.env.EVALUATE_HEALTH_TIMEOU
 /**
  * Wraps page.evaluate() with a timeout via Promise.race.
  * Prevents CDP-dead pages from blocking the pool forever.
+ *
+ * @param {number} timeoutMs - milliseconds before timeout (default: EVALUATE_HEALTH_TIMEOUT)
  */
 export async function evaluateWithTimeout(page, fn, timeoutMs = EVALUATE_HEALTH_TIMEOUT) {
   return Promise.race([
     page.evaluate(fn),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`page.evaluate timed out after ${timeoutMs}ms`)), timeoutMs)
+    ),
+  ]);
+}
+
+/**
+ * Like evaluateWithTimeout, but forwards arguments to the evaluated function.
+ * page.evaluate(fn, arg1, arg2) → evaluateInBrowser(page, fn, [arg1, arg2])
+ */
+export async function evaluateInBrowser(page, fn, args = [], timeoutMs = EVALUATE_HEALTH_TIMEOUT) {
+  return Promise.race([
+    page.evaluate(fn, ...args),
     new Promise((_, reject) =>
       setTimeout(() => reject(new Error(`page.evaluate timed out after ${timeoutMs}ms`)), timeoutMs)
     ),

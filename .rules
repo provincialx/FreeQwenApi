@@ -142,7 +142,7 @@ Boundaries: code/commits/PRs written normal.
 
 ## 8. Language
 - User-facing strings: **Russian**.
-- Comments: match file convention (English or Russian, keep consistent within file).
+- Comments: match file convention (English, keep consistent within file).
 
 ## 9. MemPalace
 You have access to MemPalace MCP server with 30 tools for long-term memory.

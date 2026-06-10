@@ -10,8 +10,17 @@ import { logInfo, logError, logWarn } from "../logger/index.js";
 
 // Page pool (browser layer) — re-exported for backward compatibility:
 // fileUpload.js, browser.js, auth.js import pagePool here.
-export { evaluateWithTimeout, EVALUATE_HEALTH_TIMEOUT } from "../browser/pagePool.js";
-import { setAuthTokenGetter, pagePool, createPage } from "../browser/pagePool.js";
+export {
+  evaluateWithTimeout,
+  evaluateInBrowser,
+  EVALUATE_HEALTH_TIMEOUT,
+} from "../browser/pagePool.js";
+import {
+  setAuthTokenGetter,
+  pagePool,
+  createPage,
+  evaluateInBrowser,
+} from "../browser/pagePool.js";
 export { pagePool, createPage };
 
 // Qwen API layer — re-exported for backward compatibility:
@@ -65,7 +74,7 @@ export async function extractAuthToken(context, forceRefresh = false) {
       });
       await delay(RETRY_DELAY);
 
-      const newToken = await page.evaluate(() => localStorage.getItem("token"));
+      const newToken = await evaluateInBrowser(page, () => localStorage.getItem("token"), [], 10_000);
       if (shouldClosePage) await page.close();
 
       if (newToken) {

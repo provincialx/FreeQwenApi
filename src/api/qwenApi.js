@@ -131,10 +131,12 @@ async function resolveCaptchaAndRetry(
       });
 
       // Qwen checks localStorage["token"] for login state. Write our saved JWT there.
-      const injected = await captchaPage.evaluate((t) => {
+      const injected = await evaluateInBrowser(
+        captchaPage,
+        (t) => {
         localStorage.setItem("token", t);
         return localStorage.getItem("token") === t;
-      }, savedToken);
+      }, [savedToken]);
 
       if (injected) logInfo(`Токен успешно восстановлен в браузере`);
       else logWarn("Не удалось записать токен в браузер");
@@ -550,7 +552,9 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
   logDebug(`Используем токен: ${token ? "Токен существует" : "Токен отсутствует"}`);
   logDebug(`API URL: ${apiUrl}`);
 
-  return page.evaluate(async (data) => {
+  return evaluateInBrowser(
+    page,
+    async (data) => {
     try {
       const t = data.token;
       if (!t) return { success: false, error: "Токен авторизации не найден" };
@@ -712,7 +716,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
     } catch (error) {
       return { success: false, error: error.toString() };
     }
-  }, requestBody);
+  }, [requestBody]);
 }
 
 async function handleApiError(
@@ -1172,7 +1176,9 @@ export async function createChatV2(
       token: getAuthToken(),
     };
 
-    const result = await page.evaluate(async (data) => {
+    const result = await evaluateInBrowser(
+      page,
+      async (data) => {
       try {
         const response = await fetch(data.apiUrl, {
           method: "POST",
@@ -1191,7 +1197,7 @@ export async function createChatV2(
       } catch (error) {
         return { success: false, error: error.toString() };
       }
-    }, requestBody);
+    }, [requestBody]);
 
     pagePool.releasePage(page);
     page = null;
@@ -1260,7 +1266,9 @@ export async function testToken(token) {
       },
     };
 
-    const result = await page.evaluate(async (data) => {
+    const result = await evaluateInBrowser(
+      page,
+      async (data) => {
       try {
         const res = await fetch(data.apiUrl, {
           method: "POST",
@@ -1274,7 +1282,7 @@ export async function testToken(token) {
       } catch (e) {
         return { ok: false, status: 0, error: e.toString() };
       }
-    }, requestBody);
+    }, [requestBody]);
 
     if (result.ok || result.status === 400) return "OK";
     if (result.status === 401 || result.status === 403) return "UNAUTHORIZED";

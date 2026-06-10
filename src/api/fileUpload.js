@@ -1,7 +1,7 @@
 import { getBrowserContext } from "../browser/browser.js";
 import { logInfo, logError } from "../logger/index.js";
 import { getAuthToken, extractAuthToken } from "./chat.js";
-import { pagePool } from "../browser/pagePool.js";
+import { pagePool, evaluateInBrowser } from "../browser/pagePool.js";
 import { getAvailableToken } from "./tokenManager.js";
 import fs from "fs";
 import path from "path";
@@ -43,7 +43,8 @@ export async function getStsToken(fileInfo) {
   let page = null;
   try {
     page = await pagePool.getPage(browserContext);
-    const result = await page.evaluate(
+    const result = await evaluateInBrowser(
+      page,
       async (data) => {
         try {
           const response = await fetch(data.apiUrl, {
@@ -66,7 +67,7 @@ export async function getStsToken(fileInfo) {
           return { success: false, error: error.toString() };
         }
       },
-      { apiUrl: STS_TOKEN_API_URL, token, fileInfo }
+      [{ apiUrl: STS_TOKEN_API_URL, token, fileInfo }]
     );
 
     if (result.success) {
@@ -117,7 +118,8 @@ export async function uploadFile(filePath, stsData) {
   let page = null;
   try {
     page = await pagePool.getPage(browserContext);
-    const result = await page.evaluate(
+    const result = await evaluateInBrowser(
+      page,
       async (data) => {
         try {
           if (typeof window.OSS === "undefined") {
