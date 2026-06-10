@@ -810,6 +810,12 @@ export async function sendMessage(
     const simulateCaptcha =
       process.env.SIMULATE_CAPTCHA === "true" && !_captchaSimulated && retryCount === 0;
 
+    if (process.env.SIMULATE_CAPTCHA) {
+      logInfo(
+        `[SIM] SIMULATE_CAPTCHA=${process.env.SIMULATE_CAPTCHA}, _captchaSimulated=${_captchaSimulated}, retryCount=${retryCount} => simulate=${simulateCaptcha}`
+      );
+    }
+
     if (simulateCaptcha) {
       _captchaSimulated = true;
       logInfo("[СИМУЛЯЦИЯ] CAPTCHA — пропускаю реальный запрос, запускаю resolver");
