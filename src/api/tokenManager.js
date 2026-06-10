@@ -93,3 +93,13 @@ export function markValid(id, newToken) {
 export function listTokens() {
   return loadTokens();
 }
+
+/** Get a specific token by accountId. Returns the token object if valid, null otherwise. */
+export function getTokenById(id) {
+  const tokens = loadTokens();
+  const now = Date.now();
+  const token = tokens.find((t) => t.id === id);
+  if (!token) return null;
+  if (token.invalid || (token.resetAt && new Date(token.resetAt).getTime() > now)) return null;
+  return token;
+}

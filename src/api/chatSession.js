@@ -314,9 +314,27 @@ export function invalidateQwenChatId(qwenChatId) {
     }
   }
 
+  // Clean chatTokenOwner mapping for this stale chat
+  chatTokenOwner.delete(qwenChatId);
+
   if (removed) {
     logInfo(`♻️ Инвалидирован несуществующий Qwen чат: ${qwenChatId}`);
   }
+}
+
+// ─── Chat-to-Token Ownership ──────────────────────────────────────────────
+// Each Qwen chat is owned by the account that created it. Prevents cross-account "not exist" errors.
+const chatTokenOwner = new Map(); // qwenChatId -> tokenObj.id
+
+export function setChatTokenOwner(qwenChatId, tokenId) {
+  if (qwenChatId && tokenId) {
+    chatTokenOwner.set(qwenChatId, tokenId);
+    logDebug(`Привязка чата ${qwenChatId} -> аккаунт ${tokenId}`);
+  }
+}
+
+export function getChatTokenOwner(qwenChatId) {
+  return qwenChatId ? chatTokenOwner.get(qwenChatId) : null;
 }
 
 // Expose for auto-reset increment in routes
@@ -587,6 +605,25 @@ setInterval(() => {
       idempotencyCache.delete(k);
       idemCleaned++;
     }
+  }
+
+  // Clean chatTokenOwner — cap at reasonable size to prevent unbounded growth.
+  const MAX_OWNER_SIZE = 500;
+  if (chatTokenOwner.size > MAX_OWNER_SIZE) {
+    const ownerToEvict = chatTokenOwner.size - Math.floor(MAX_OWNER_SIZE / 2);
+    let ownerEvicted = 0;
+    for (const key of chatTokenOwner.keys()) {
+      if (ownerEvicted >= ownerToEvict) break;
+      // Only evict if this qwenChatId is no longer referenced elsewhere
+      const stillReferenced = [...chatIdMap.values()].includes(key);
+      if (!stillReferenced) {
+        chatTokenOwner.delete(key);
+        ownerEvicted++;
+      }
+    }
+    logDebug(
+      `chatTokenOwner GC: evicted ${ownerEvicted} entries, ${chatTokenOwner.size} remaining`
+    );
   }
 
   const total = cleaned + modelCleaned + idemCleaned;

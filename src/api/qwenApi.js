@@ -18,8 +18,8 @@ import { checkAuthentication, checkVerification } from "../browser/auth.js";
 import { shutdownBrowser, initBrowser } from "../browser/browser.js";
 import { saveAuthToken } from "../browser/session.js";
 import { pagePool, createPage, evaluateWithTimeout } from "../browser/pagePool.js";
-import { getAvailableToken, markRateLimited } from "./tokenManager.js";
-import { invalidateQwenChatId } from "./chatSession.js";
+import { getAvailableToken, getTokenById, markRateLimited } from "./tokenManager.js";
+import { invalidateQwenChatId, setChatTokenOwner, getChatTokenOwner } from "./chatSession.js";
 import { logInfo, logError, logWarn, logDebug } from "../logger/index.js";
 import crypto from "crypto";
 import {
@@ -108,7 +108,20 @@ function validateAndPrepareMessage(message) {
   return { error: "Неподдерживаемый формат сообщения" };
 }
 
-async function resolveAuthToken(browserContext) {
+async function resolveAuthToken(browserContext, preferredOwnerId = null) {
+  // Try the chat's owner token first — Qwen chats belong to a specific account.
+  // Without this, createChatV2() creates on account A but sendMessage uses B → "not exist".
+  if (preferredOwnerId) {
+    const ownedToken = getTokenById(preferredOwnerId);
+    if (ownedToken && ownedToken.token) {
+      setAuthToken(ownedToken.token);
+      logInfo(`♻️ Используем привязанный аккаунт: ${ownedToken.id}`);
+      return ownedToken;
+    } else {
+      logWarn(`Привязанный аккаунт ${preferredOwnerId} недоступен — используем любой доступный`);
+    }
+  }
+
   const tokenObj = await getAvailableToken();
   if (tokenObj && tokenObj.token) {
     setAuthToken(tokenObj.token);
@@ -758,7 +771,10 @@ export async function sendMessage(
   const browserContext = getBrowserContext();
   if (!browserContext) return { error: "Браузер не инициализирован", chatId };
 
-  const tokenObj = await resolveAuthToken(browserContext);
+  // Use the token that created this chat — Qwen chats belong to a specific account.
+  // Without ownership, rotation picks random account → "not exist" on other accounts' chats.
+  const preferredOwner = getChatTokenOwner(chatId);
+  const tokenObj = await resolveAuthToken(browserContext, preferredOwner);
   if (!tokenObj) return { error: "Ошибка авторизации: не удалось получить токен", chatId };
 
   let page = null;
@@ -1093,10 +1109,17 @@ export async function createChatV2(
     page = null;
 
     if (result.success && result.data.success) {
-      logInfo(`Чат создан: ${result.data.data.id}`);
+      const createdChatId = result.data.data.id;
+      logInfo(`Чат создан: ${createdChatId}`);
+
+      // Bind this chat to the account that created it — prevents cross-account "not exist" errors
+      if (resolvedTokenObj?.id) {
+        setChatTokenOwner(createdChatId, resolvedTokenObj.id);
+      }
+
       return {
         success: true,
-        chatId: result.data.data.id,
+        chatId: createdChatId,
         requestId: result.data.request_id,
       };
     }
@@ -1107,7 +1130,7 @@ export async function createChatV2(
         `Создание чата: ${result.status}, ретрай ${retryCount + 1}/${MAX_RETRY_COUNT} через ${RETRY_DELAY}мс...`
       );
       await delay(RETRY_DELAY);
-      return createChatV2(model, title, retryCount + 1);
+      return createChatV2(model, title, retryCount + 1, resolvedTokenObj);
     }
 
     const cleanError = isTransient

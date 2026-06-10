@@ -29,7 +29,7 @@ src/
 │   ├── fileUpload.js               # Alibaba Cloud OSS upload via STS credentials
 │   ├── modelMapping.js             # External → internal model name mapping table
 │   ├── projectContext.js           # Anti-hallucination: FS scan → compact tree injected into system msg
-│   ├── tokenManager.js             # Token rotation, account status tracking (OK/RATELIMIT/INVALID)
+│   ├── tokenManager.js             # Token rotation, getTokenById(S47), status tracking
 │   └── timeoutWrapper.js           # withRequestTimeout() — Promise.race wrapper for REQUEST_TIMEOUT_MINUTES
 │
 ├── browser/                        # Puppeteer + Chromium management
@@ -145,8 +145,8 @@ flowchart LR
 | File | LOC | Notes |
 |------|-----|-------|
 | routes.js | ~1030 | Main handler. Grew with agent-loop logic (S22, S42). Refactored from 2390 → current via S11-14 splits. |
-| qwenApi.js | ~1400 | Qwen API interaction: sendMessage, createChatV2, executeApiRequest variants |
-| chatSession.js | ~600 | Chat ID resolution (S46 defaultResolved), invalidateQwenChatId, session persistence, force-folding |
+| qwenApi.js | ~1430 | Qwen API interaction: sendMessage, createChatV2, resolveAuthToken(S47 ownership) |
+| chatSession.js | ~620 | Chat ID resolution, invalidateQwenChatId, chatTokenOwner Map (S47), session persistence |
 | pagePool.js | ~290 | Page lifecycle with health checks + GC timer (S13, S31) |
 | openaiUtils.js | ~400 | Message parsing, tool state detection, compact builder port from Python fork (S23) |
 | responseBuilders.js | ~260 | buildOpenAIToolResponse, writeToolCallsSse with chunk splitting (S29) |
