@@ -242,6 +242,11 @@ function parseNonSseCompletionBody(body) {
     // Ignore parse errors here and return a generic failure below.
   }
 
+  // CAPTCHA detection at parse level — ensure we catch it regardless of which path returns this.
+  if (body && body.includes("FAIL_SYS_USER_VALIDATE")) {
+    return { success: false, isCaptcha: true, errorBody: body };
+  }
+
   return {
     success: false,
     error: "Unexpected non-SSE 200 response",
@@ -468,7 +473,11 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
               Boolean(topLevelCode) ||
               Boolean(nestedCode);
 
-            // API иногда возвращает JSON с success=false и code при HTTP 200.
+            // CAPTCHA can be in structured error too.
+            if (hasStructuredError && body.includes("FAIL_SYS_USER_VALIDATE")) {
+              return { success: false, isCaptcha: true, errorBody: body };
+            }
+
             if (hasStructuredError) {
               const isRateLimited = topLevelCode === "RateLimited" || nestedCode === "RateLimited";
               return {
@@ -477,13 +486,19 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                 errorBody: body,
               };
             }
-            // Валидный JSON-ответ completion (иногда Qwen возвращает так)
+
             if (parsed.choices || parsed.id || (parsed.success === true && parsed.data)) {
               return { success: true, isTask: false, data: parsed };
             }
           } catch {
-            /* not JSON, treat as unexpected */
+            /* not JSON */
           }
+
+          // CAPTCHA check inside browser evaluate.
+          if (body && body.includes("FAIL_SYS_USER_VALIDATE")) {
+            return { success: false, isCaptcha: true, errorBody: body };
+          }
+
           return {
             success: false,
             error: "Unexpected non-SSE 200 response",
@@ -803,9 +818,15 @@ export async function sendMessage(
       }
       return response.data;
     } else {
+      // Debug: log response keys to understand what path is used
+      logInfo(`[ERR] keys=${Object.keys(response).join(",")} status=${response.status}`);
+
       // ── CAPTCHA detection (FAIL_SYS_USER_VALIDATE) ─────────────────────
-      if (response.errorBody && String(response.errorBody).includes("FAIL_SYS_USER_VALIDATE")) {
-        console.log("------------------------------------------------------");
+      if (
+        response.isCaptcha ||
+        (response.errorBody && String(response.errorBody).includes("FAIL_SYS_USER_VALIDATE"))
+      ) {
+        console.log("\n------------------------------------------------------");
         console.log("              ⚠️  ЗАПРОШЕНА КАПЧА (CAPTCHA)");
         console.log("------------------------------------------------------");
         console.log(
@@ -813,8 +834,6 @@ export async function sendMessage(
         );
         console.log("------------------------------------------------------");
 
-        // Show browser and wait for user to solve.
-        await pagePool.getPage(browserContext);
         try {
           const captchaPage = await pagePool.getPage(browserContext);
           await captchaPage.goto(CHAT_PAGE_URL, {
@@ -822,7 +841,6 @@ export async function sendMessage(
             timeout: PAGE_TIMEOUT,
           });
 
-          // CLI prompt — stdin wait.
           console.log("\nПосле прохождения CAPTCHA нажмите ENTER...");
           await new Promise((resolve) => {
             process.stdout.write("> ");
@@ -844,15 +862,14 @@ export async function sendMessage(
           if (newToken) {
             setAuthToken(newToken);
             saveAuthToken(newToken);
-            logInfo(`Токен обновлён после CAPTCHA: ${String(newToken).substring(0, 12)}...`);
+            logInfo(`Токен обновлён после CAPTCHA`);
           }
 
           pagePool.releasePage(captchaPage);
-        } catch (e) {
+        } catch {
           console.log("CAPTCHA сессия завершена.");
         }
 
-        // Retry with retryCount + 1 to prevent infinite loop if captcha fails again.
         return sendMessage(
           message,
           model,
