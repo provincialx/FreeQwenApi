@@ -1,3 +1,8 @@
+## Tool Path & Edit Rules (CRITICAL)
+- **All paths MUST start with `FreeQwenApi/`**, including root files: `FreeQwenApi/README-en.md`, `FreeQwenApi/.rules`, `FreeQwenApi/package.json`. Never pass bare filenames.
+- When using `edit_file`, strip line number prefixes from `read_file` output. `old_text` must contain ONLY the raw file content, never ` 105 | text...` style prefixes.
+- Verify exact whitespace match (tabs vs spaces) in `old_text`. On Windows, CRLF/LF mismatches cause silent failures — copy verbatim from `read_file` output after line numbers.
+
 ## Tool Usage Policy
 - Always use tools (list_directory, read_file, grep) to verify file and code state.
 - Never answer about file existence or code contents from memory — only via tools.
