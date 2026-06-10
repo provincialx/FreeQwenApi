@@ -166,5 +166,6 @@ flowchart TD
 | `parent_id.*not exist` | Retry same chat, reset parentId to null | No (null) | Yes | 1 |
 | `chat_not_exist` / `/not exist/i` | Create new chat via createChatV2 **with same token**, parentId=null, gated by `retryCount === 0` | No (null) | No (new) | 1 |
 | `"chat is in progress"` | Wait + retry **same** chat with same parentId | Yes | Yes | 3, then escalate to new-chat fallback |
+| `FAIL_SYS_USER_VALIDATE` (CAPTCHA) | Show visible browser, wait for user Enter, then retry once | Yes | Yes | 1 |
 
 S42 fix: "in progress" retries wait 2s/4s before re-sending to the SAME chat. Only falls back to creating a new chat after all same-chat retries exhausted. Old behavior created a fresh chat immediately which broke tool-calling context continuity.

@@ -33,6 +33,60 @@ import {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// ─── CLI prompt helper (same pattern as auth.js) ──────────────────────────────
+async function promptUser(message) {
+  return new Promise((resolve) => {
+    process.stdout.write(message);
+    const onData = (data) => {
+      process.stdin.removeListener("data", onData);
+      process.stdin.pause();
+      resolve(data.toString().trim());
+    };
+    process.stdin.resume();
+    process.stdin.once("data", onData);
+  });
+}
+
+// ─── CAPTCHA detection ────────────────────────────────────────────────────────
+function isCaptchaChallenge(errorBody) {
+  const body = errorBody || "";
+  return body.includes("FAIL_SYS_USER_VALIDATE");
+}
+
+async function resolveCaptcha(browserContext) {
+  // Show browser so user can see and solve the CAPTCHA.
+  console.log("------------------------------------------------------");
+  console.log("              ⚠️  ЗАПРОШЕНА КАПЧА (CAPTCHA)");
+  console.log("------------------------------------------------------");
+  console.log(
+    "Qwen определил подозрительную активность и запросил CAPTCHA.\nПросмотрите открытый браузер, решите капчу, затем нажмите ENTER."
+  );
+  console.log("------------------------------------------------------");
+
+  try {
+    const page = await pagePool.getPage(browserContext);
+    try {
+      // Navigate to chat list — Qwen shows CAPTCHA challenge on the main page.
+      await page.goto(CHAT_PAGE_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: PAGE_TIMEOUT,
+      });
+      await delay(2000);
+    } catch (e) {
+      logWarn(`Не удалось загрузить страницу для CAPTCHA: ${e.message}`);
+    }
+
+    // Wait for user to solve captcha manually.
+    await promptUser("\nПосле прохождения CAPTCHA нажмите ENTER... ");
+    console.log("CAPTCHA подтверждена, ожидание применения...");
+    await delay(3000); // Give Qwen time to register the solved captcha
+
+    pagePool.releasePage(page);
+  } catch (e) {
+    logWarn(`Ошибка при обработке CAPTCHA: ${e.message}`);
+  }
+}
+
 // ─── sendMessage — helper functions ──────────────────────────────────────────
 
 function validateAndPrepareMessage(message) {
@@ -760,6 +814,24 @@ export async function sendMessage(
         retryCount,
         onChunk
       );
+
+      // CAPTCHA challenge: Qwen rate-limited the account — show browser, wait for user.
+      if (response.errorBody && isCaptchaChallenge(response.errorBody) && retryCount === 0) {
+        logWarn(`CAPTCHA запрошена для чата ${chatId}. Показываю браузер...`);
+        await resolveCaptcha(browserContext);
+        return sendMessage(
+          message,
+          model,
+          chatId,
+          parentId,
+          files,
+          tools,
+          toolChoice,
+          systemMessage,
+          retryCount + 1,
+          onChunk
+        );
+      }
 
       // Distinguish between parent_id not exist and chat not exist.
       // "parent_id X is not exist" means the stale parentId was cached — just reset it.
