@@ -10,6 +10,7 @@
 |---|-------|--------|-------|
 | D5 | Page pool memory accumulates at extreme agent-loop (>100 calls) | Memory leak grows monotonically under sustained heavy usage | Hard limit 5 + idle TTL GC mitigated acute cases. Consider auto-refreshing pages after N requests or T seconds alive-time to prevent Chromium DOM/JS heap growth regardless of pool size. |
 | D6 | No integration/end-to-end tests — only unit tests | Regression testing requires manual smoke tests via running server | Unit suite (46 tests) covers pure logic functions well but not browser interaction, SSE delivery, or chat ID resolution end-to-end. Smoke test script exists (`scripts/smoke_test.js`) but needs live server + browser to run. |
+| D7 | CAPTCHA resolver requires manual console interaction | Visible browser + Enter key press blocks automated pipelines | S52 added `SIMULATE_CAPTCHA` for dev testing, but production CAPTCHA still needs human-in-the-loop. Consider auto-solver integration or headless CAPTCHA service if rate increases. |
 
 ## Resolved issues archive (cross-reference)
 

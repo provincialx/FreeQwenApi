@@ -20,10 +20,11 @@ src/
 │   │   ├── buildPayloadV2() — construct /api/v2/chat/completions payload
 │   │   ├── parseNonSseCompletionBody() — detect ret[], code, captcha/overload in non-SSE 200 responses (S43)
 │   │   ├── executeApiRequest() — browser.evaluate fetch with reader timeout guard against stream hangs (S48)
+│   │   ├── resolveCaptchaAndRetry() — centralized CAPTCHA handler: JWT save/inject, visible browser cycle, retry (S52)
 │   │   └── handleApiError() — classify & route errors to retry paths
 │   │       ├─ 401 → rotate token, retry
 │   │       ├─ 429 RateLimited → mark rate-limited, try next token
-│   │       ├─ 503 overload/CAPTCHA → trigger resolveCaptchaChallenge or backoff retry (S48)
+│   │       ├─ 503 overload/CAPTCHA → trigger resolveCaptchaAndRetry or backoff retry (S48, S52)
 │   │       └─ generic → return error with details
 │   ├── chat.js                     # Token state + model/key loaders. Re-exports from qwenApi.js, pagePool.js
 │   ├── toolUtils.js                # Tool prompt injection & parseToolCallParts (JSON extraction)
@@ -39,6 +40,9 @@ src/
 │
 ├── browser/                        # Puppeteer + Chromium management
 │   ├── browser.js                  # Puppeteer launch config, stealth evasion, protocolTimeout setting (S41)
+│   │   ├── dumpio: false — suppress Chromium crashpad binary dumps on stderr (S52)
+│   │   ├── waitUntil: "domcontentloaded" — replaces networkidle2 in manual auth, eliminates 60s timeout (S52)
+│   │   └── skipManualRestart param — visible browser init without blocking auth flow for CAPTCHA resolver (S52)
 │   ├── pagePool.js                 # Page pool: health-check checkout/release, idle TTL GC (S31)
 │   │   ├── getPage() — acquire page from pool with evaluate timeout health check
 │   │   ├── releasePage() — return to pool or close if invalid
@@ -47,7 +51,7 @@ src/
 │   ├── auth.js                     # Auth verification + CAPTCHA resolution
 │   │   ├── checkAuthentication() — detect login needed, extract token after manual auth
 │   │   ├── checkVerification() — page-level verification prompt
-│   │   └── resolveCaptchaChallenge() — handle Qwen slider CAPTCHA by restarting Chromium headed (S48)
+│   │   └── resolveCaptchaChallenge() — legacy CAPTCHA entry point, now delegated to resolveCaptchaAndRetry (S48→S52)
 │   └── session.js                  # Cookie/token extraction + persistence (localStorage via page.evaluate)
 │
 ├── logger/                         # Logging infrastructure
@@ -155,7 +159,7 @@ flowchart LR
 | File | LOC | Notes |
 |------|-----|-------|
 | routes.js | ~1030 | Main handler. Grew with agent-loop logic (S22, S42). Refactored from 2390 → current via S11-14 splits. |
-| qwenApi.js | ~1400 | Qwen API interaction: sendMessage, createChatV2, executeApiRequest variants |
+| qwenApi.js | ~1400 | Qwen API interaction: sendMessage, createChatV2, executeApiRequest, resolveCaptchaAndRetry (S52) |
 | chatSession.js | ~540 | Chat ID resolution/generation/normalization, session persistence, folding trigger |
 | pagePool.js | ~290 | Page lifecycle with health checks + GC timer (S13, S31, S45) |
 | openaiUtils.js | ~400 | Message parsing, tool state detection, buildStatelessTranscript, compact builder port from Python fork (S23) |

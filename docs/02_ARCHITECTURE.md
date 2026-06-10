@@ -163,7 +163,7 @@ flowchart TD
 | `"chat is in progress"` | Wait + retry **same** chat with same parentId | Yes | Yes | 3, then escalate to new-chat fallback |
 | `FAIL_SYS_USER_VALIDATE` (CAPTCHA) | Show visible browser, wait for user Enter, restart headless, retry same request preserving parentId + chatId | Yes | Yes | 2 |
 
-## CAPTCHA resolution flow (S48)
+## CAPTCHA resolution flow (S48, refactored S52)
 
 Qwen added a slider CAPTCHA (`FAIL_SYS_USER_VALIDATE`) that returns HTTP 200 with JSON error body containing `"action=captcha&punchCpatcha="...`. The response may claim `content-type: text/event-stream` but send either:
 1. Immediate JSON error (detected via non-SSE parser)
@@ -171,13 +171,21 @@ Qwen added a slider CAPTCHA (`FAIL_SYS_USER_VALIDATE`) that returns HTTP 200 wit
 
 **Detection:** `parseNonSseCompletionBody()` detects `ret["FAIL_SYS_USER_VALIDATE"]` or `/captcha|punish/i` in body → maps to HTTP 503.
 
-**Resolution (first attempt only):**
-1. `handleApiError(503)` calls `resolveCaptchaChallenge()` from `auth.js`
-2. Chromium restarts in **visible headed mode**
-3. Opens `chat.qwen.ai` page where slider CAPTCHA appears
-4. User drags slider, waits for Enter prompt
-5. Token + session saved → browser restarts headless → original request retries with fresh token
-6. If resolver already running or fails → fallback to 2 backoff attempts (5s/10s) before final error.
+**Resolution (centralized in `resolveCaptchaAndRetry()` since S52):**
+1. `sendMessage()` detects CAPTCHA (real `FAIL_SYS_USER_VALIDATE` or simulated via `SIMULATE_CAPTCHA=true`)
+2. `resolveCaptchaAndRetry()` handles full cycle:
+   - Save JWT token from `getAuthToken()` before shutdown
+   - `shutdownBrowser(headless)` + 2s delay
+   - `initBrowser(visible=true, skipManualAuth=true)` — skip blocking auth flow
+   - `page.goto(CHAT_PAGE_URL)` with `waitUntil: "domcontentloaded"` (S52 fix: was `networkidle2`, caused 60s timeout)
+   - `page.evaluate(() => localStorage.setItem("token", savedToken))` — JWT inject for instant Qwen auth
+   - Wait for user Enter in console (slider CAPTCHA / verification)
+   - 3s delay → re-extract token from localStorage → update in proxy
+   - `shutdownBrowser(visible)` + 2s delay → `initBrowser(headless=true)`
+   - Retry `sendMessage(retryCount + 1)` preserving parentId + chatId
+3. If resolver already running or fails → fallback to 2 backoff attempts (5s/10s) before final error.
+
+**SIMULATE_CAPTCHA test mode (S52):** Set `SIMULATE_CAPTCHA=true` in `.env` or environment. Triggers exactly once per process (`_captchaSimulated` flag) on first request, returning `{ success: false, isCaptcha: true }`. Allows testing full resolver cycle without waiting for real Qwen CAPTCHA.
 
 **Guard against loops:** `_captchaResolverRunning` flag prevents multiple concurrent CAPTCHA resolvers from infinite-restarting Chromium.
 
