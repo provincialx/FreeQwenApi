@@ -844,9 +844,8 @@ export async function sendMessage(
     logInfo("Отправка запроса к API v2...");
 
     // CAPTCHA simulation: inject fake error response to test resolver e2e.
-    // Fires once per process, only on first call (retryCount === 0).
-    const simulateCaptcha =
-      process.env.SIMULATE_CAPTCHA === "true" && !_captchaSimulated && retryCount === 0;
+    // Fires once per process. _captchaSimulated flag prevents loops on retries.
+    const simulateCaptcha = process.env.SIMULATE_CAPTCHA === "true" && !_captchaSimulated;
 
     if (simulateCaptcha) {
       _captchaSimulated = true;
