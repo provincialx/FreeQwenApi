@@ -58,10 +58,7 @@ src/
     ├── prompt.js                   # Prompt formatting helpers (multiline, dedent)
     └── accountSetup.js             # Account configuration CLI logic
 
-agents/skills/                      # Global agent skills loaded at session start
-├── edit-path-fix/SKILL.md          # Ensures file paths include project root prefix (S50)
-├── context7-mcp/SKILL.md           # Library/framework documentation queries
-└── find-docs/SKILL.md              # API/reference documentation retrieval
+
 
 tests/unit/                         # Node.js built-in test runner (npm test)
 ├── toolUtils.test.js               # parseToolCallParts, normalizeToolCalls, toolsToPrompt variants

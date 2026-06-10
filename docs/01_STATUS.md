@@ -12,10 +12,10 @@ All core paths operational. 50 development sessions across 4 days (June 7–10).
 | Page pool memory | Mitigated | Hard limit 5 pages, idle TTL 5min, periodic GC every 60s |
 | Timeout enforcement | Active | `REQUEST_TIMEOUT_MINUTES` (3m) wrapper + protocolTimeout synced at 8m |
 | Unit tests | Passing | 46/46 (`npm test`) |
-| ESLint | Clean | 0 errors, ~10 warnings (known unused imports — tech-debt) |
+| ESLint | Clean | 0 errors, ~37 warnings (known unused imports — tech-debt) |
 | Prettier | Formatted | All files clean |
 | CAPTCHA handling | Active | Visible browser resolver + reader timeout guard against stream hangs |
-| Agent skill infrastructure | Active | Global `edit-path-fix` skill ensures root-level files resolve correctly (S49) |
+
 
 ## Quick Start
 
