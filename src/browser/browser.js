@@ -159,8 +159,10 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
     browserContext = page;
     logInfo("Браузер инициализирован с максимальной защитой от обнаружения");
 
-    if (visibleMode) {
-      await startManualAuthenticationPuppeteer(page, skipManualRestart);
+    // When CAPTCHA resolver calls initBrowser(true, true), it handles auth itself.
+    // skipManualRestart=true means: "don't run manual auth flow". We only need visible browser.
+    if (visibleMode && !skipManualRestart) {
+      await startManualAuthenticationPuppeteer(page);
     }
     // loadSessionPuppeteer removed — was dead code (always returned false)
 
@@ -193,8 +195,10 @@ async function saveSessionPuppeteer(page) {
 async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
   try {
     logInfo("Открытие страницы для ручной авторизации...");
+    // Use domcontentloaded instead of networkidle2 — Qwen Studio never truly goes idle
+    // (constant analytics/telemetry requests) which causes 60s timeout.
     await page.goto(CHAT_PAGE_URL, {
-      waitUntil: "networkidle2",
+      waitUntil: "domcontentloaded",
       timeout: NAVIGATION_TIMEOUT,
     });
     await delay(5000);
