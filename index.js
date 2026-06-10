@@ -205,6 +205,12 @@ async function startServer() {
       logInfo(`Сервер запущен на ${host}:${port}`);
       logInfo(`API доступен по адресу: http://${displayHost}:${port}/api`);
 
+      // Show SIMULATE_CAPTCHA status at startup for debug.
+      const simCaptcha = process.env.SIMULATE_CAPTCHA;
+      if (simCaptcha) {
+        logWarn(`⚠️  SIMULATE_CAPTCHA=${simCaptcha} — первый запрос будет имитировать капчу`);
+      }
+
       getApiKeys();
       getAvailableModelsFromFile();
     });
