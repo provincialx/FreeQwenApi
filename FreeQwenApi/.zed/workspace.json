@@ -1,0 +1,21 @@
+{
+  "root": "/",
+  "agent": {
+    "default_profile": "write",
+    "profiles": {
+      "write": {
+        "name": "Write",
+        "enable_all_context_servers": true,
+        "tools": {
+          "terminal": true
+        }
+      }
+    },
+    "tool_permissions": {
+      "default": "allow"
+    },
+    "context": {
+      "paths_require_project_root_prefix": true
+    }
+  }
+}
