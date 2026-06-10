@@ -51,8 +51,8 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
     // Reuse Chrome profile with real sessions/cookies/passwords.
     const userDataDir = process.env.CHROME_USER_DATA_DIR;
     if (userDataDir) {
-      chromeArgs.push(`--user-data-dir=${userDataDir}`);
-      chromeArgs.push("--profile-directory=Default");
+      chromeArgs.push(`--user-data-dir="${userDataDir}"`); // Quote for paths with spaces
+      chromeArgs.push("--profile-directory=Default"); // Use main profile where user is logged in
       logInfo(`Используем Chrome профиль: ${userDataDir}`);
     }
 
