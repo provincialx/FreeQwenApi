@@ -32,6 +32,30 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
 
   logInfo("Инициализация браузера с Puppeteer Stealth...");
   try {
+    const chromeArgs = [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-dev-shm-usage",
+      "--disable-web-security",
+      "--disable-features=IsolateOrigins,site-per-process",
+      `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
+      "--start-maximized",
+      "--disable-infobars",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--ignore-certificate-errors",
+      "--ignore-certificate-errors-spki-list",
+    ];
+
+    // Reuse Chrome profile with real sessions/cookies/passwords.
+    const userDataDir = process.env.CHROME_USER_DATA_DIR;
+    if (userDataDir) {
+      chromeArgs.push(`--user-data-dir=${userDataDir}`);
+      chromeArgs.push("--profile-directory=Default");
+      logInfo(`Используем Chrome профиль: ${userDataDir}`);
+    }
+
     browserInstance = await puppeteer.launch({
       headless: !visibleMode,
       slowMo: visibleMode ? 30 : 0,
@@ -42,25 +66,10 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
       protocolTimeout:
         Number(process.env.PROTOCOL_TIMEOUT) ||
         (Number(process.env.REQUEST_TIMEOUT_MINUTES) || 3 + 5) * 60_000,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage",
-        "--disable-web-security",
-        "--disable-features=IsolateOrigins,site-per-process",
-        `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
-        "--start-maximized",
-        "--disable-infobars",
-        "--disable-extensions",
-        "--disable-gpu",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--ignore-certificate-errors",
-        "--ignore-certificate-errors-spki-list",
-      ],
+      args: chromeArgs,
       defaultViewport: { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT },
       ignoreHTTPSErrors: true,
+      dumpio: false,
     });
 
     const pages = await browserInstance.pages();
