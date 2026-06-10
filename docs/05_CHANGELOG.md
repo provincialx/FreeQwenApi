@@ -13,6 +13,7 @@
 | 41 | protocolTimeout alignment | `protocolTimeout = max(env, (REQUEST_TIMEOUT_MINUTES+5)*60s)`. Synced CDP timeout to ~8m instead of raw 10m so zombie promises don't hold page pool slots. | browser.js |
 | 42 | "in progress" race condition | Same-chat retry with backoff (~2s, ~4s delay, max 3 attempts). Agent-loop cooldown: 1s pre-send delay when `inAgentLoop=true`. | qwenApi.js, routes.js |
 | 43 | Memory Guard (RSS-based Chromium restart) | Periodic RSS check every N getPage() calls. Auto-restart Chromium via save-token → shutdown → init headless when RSS > BROWSER_RESTART_RSS_MB (default 512MB). Prevents OOM kills during long agent loops. Config: `BROWSER_RESTART_RSS_MB`, `MEMORY_CHECK_INTERVAL`. | browser.js, pagePool.js, config.js |
+| 44 | Infinite loop on chat_not_exist after bulk delete | Two bugs: (1) createChatV2 rotated to a different token than sendMessage — newly created chats owned by another account immediately returned "not exist". Fixed by passing resolved tokenObj from sendMessage context. (2) No retryCount guard on chat_not_exist handler — infinite recursion when new chat also fails. Added `retryCount === 0` check for one-shot retry. | qwenApi.js |
 
 ## Tool calling (Sessions 7–38, ongoing)
 

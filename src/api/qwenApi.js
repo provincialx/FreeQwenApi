@@ -787,9 +787,10 @@ export async function sendMessage(
         }
       }
 
-      if (response.errorBody && /not exist/i.test(response.errorBody)) {
+      // Only allow ONE new-chat creation on "not exist" to prevent infinite loop.
+      if (response.errorBody && /not exist/i.test(response.errorBody) && retryCount === 0) {
         logWarn(`Qwen чат ${chatId} больше не существует. Создаю новый и повторяю запрос...`);
-        const newChatResult = await createChatV2(model, "Сессия", 0);
+        const newChatResult = await createChatV2(model, "Сессия", 0, tokenObj);
         if (newChatResult && newChatResult.chatId) {
           // Retry with new chat. Reset parentId — old parent message doesn't exist in the new chat.
           const retryResult = await sendMessage(
@@ -843,9 +844,8 @@ export async function sendMessage(
           logWarn(
             `Qwen чат ${chatId} заблокирован ("in progress") после ${retryCount} попыток. Создаю новый чат...`
           );
-          const newChatResult = await createChatV2(model, "Сессия", 0);
+          const newChatResult = await createChatV2(model, "Сессия", 0, tokenObj);
           if (newChatResult && newChatResult.chatId) {
-            // Reset parentId — old parent message doesn't exist in the new chat.
             const retryResult = await sendMessage(
               message,
               model,
@@ -881,14 +881,27 @@ export async function sendMessage(
 
 // ─── createChatV2 ────────────────────────────────────────────────────────────
 
-export async function createChatV2(model = DEFAULT_MODEL, title = "Новый чат", retryCount = 0) {
+export async function createChatV2(
+  model = DEFAULT_MODEL,
+  title = "Новый чат",
+  retryCount = 0,
+  tokenObj = null
+) {
   const browserContext = getBrowserContext();
   if (!browserContext) return { error: "Браузер не инициализирован" };
 
-  const tokenObj = await getAvailableToken();
-  if (tokenObj?.token) {
-    setAuthToken(tokenObj.token);
-    logInfo(`Используется аккаунт для создания чата: ${tokenObj.id}`);
+  // Reuse provided token (from sendMessage context) to avoid creating
+  // chat under one account then sending message from another.
+  let resolvedTokenObj = tokenObj;
+  if (!resolvedTokenObj) {
+    resolvedTokenObj = await getAvailableToken();
+    if (resolvedTokenObj?.token) {
+      setAuthToken(resolvedTokenObj.token);
+      logInfo(`Используется аккаунт для создания чата: ${resolvedTokenObj.id}`);
+    }
+  } else if (resolvedTokenObj?.token) {
+    setAuthToken(resolvedTokenObj.token);
+    logInfo(`Переиспользуется аккаунт для создания чата: ${resolvedTokenObj.id}`);
   }
 
   if (!getAuthToken()) {
