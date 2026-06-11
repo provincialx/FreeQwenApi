@@ -610,8 +610,23 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
           controller.abort();
         }, 120_000);
 
-        const response = await fetch(data.apiUrl, {
+        // Debug info returned in case we hang at fetch()
+        const startMs = Date.now();
+        const browserHostname = typeof location !== "undefined" ? location.hostname : "unknown";
+
+        // Use relative URL to keep same-origin — Qwen requires cookies from session.
+        // If data.apiUrl is absolute (https://chat.qwen.ai/...), extract just path+query.
+        let fetchUrl = data.apiUrl;
+        if (fetchUrl.startsWith("http")) {
+          try {
+            const urlObj = new URL(fetchUrl);
+            fetchUrl = urlObj.pathname + urlObj.search;
+          } catch {}
+        }
+
+        const response = await fetch(fetchUrl, {
           method: "POST",
+          credentials: "include", // Send browser cookies — Qwen needs session, not just Bearer token
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${data.token}`,
@@ -621,10 +636,24 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
           signal: controller.signal,
         }).finally(() => clearTimeout(timeoutId));
 
+        // Log response metadata for Node-side debugging
+        const respMeta = {
+          status: response.status,
+          contentType: response.headers.get("content-type") || "",
+          elapsedMs: Date.now() - startMs,
+          browserHost: browserHostname,
+          urlCalled: data.apiUrl.substring(0, 120),
+        };
+
         if (response.ok) {
           const contentType = response.headers.get("content-type") || "";
           if (!contentType.includes("text/event-stream")) {
-            return parseNonSseCompletionBody(await response.text());
+            const bodyText = await response.text();
+            return {
+              ...parseNonSseCompletionBody(bodyText),
+              debugMeta: respMeta,
+              responseBodyPreview: (bodyText || "").substring(0, 300),
+            };
           }
 
           // SSE stream inside browser. Must collect fully because CDP is locked during this.
@@ -970,6 +999,7 @@ export async function sendMessage(
 
         // Navigate to chat.qwen.ai if needed — origin mismatch breaks fetch.
         const currentHost = await page.evaluate(() => location.hostname);
+        logDebug(`[Path2] Current host: ${currentHost}`);
         if (currentHost !== "chat.qwen.ai") {
           logDebug(`Navigating from ${currentHost} → ${CHAT_PAGE_URL}`);
           await page.goto(CHAT_PAGE_URL, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT });
@@ -988,12 +1018,47 @@ export async function sendMessage(
           }
         }
 
+        // Verify the page has session cookies — Qwen API requires them for browser-origin requests.
+        // A fresh pagePool-page without cookies will hang on fetch() even in browser context.
+        const cookieCount = (await page.cookies("https://chat.qwen.ai")).length;
+        logDebug(`[Path2] Page has ${cookieCount} cookies for chat.qwen.ai`);
+        if (cookieCount === 0) {
+          logWarn("⚠️ Path2 page has no cookies! Restoring from browser context...");
+          // Restore cookies from the main auth page
+          const basePage = getBrowserContext();
+          if (basePage) {
+            try {
+              const baseCookies = await basePage.cookies("https://chat.qwen.ai");
+              logDebug(`[Path2] Base page has ${baseCookies.length} cookies, restoring...`);
+              await page.setCookie(...baseCookies);
+            } catch (e) {
+              logWarn(`[Path2] Could not restore cookies: ${e.message}`);
+            }
+          }
+        }
+
+        const path2Start = Date.now();
         response = await executeApiRequest(page, apiUrl, payload, getAuthToken(), onChunk);
+        const path2Elapsed = ((Date.now() - path2Start) / 1000).toFixed(1);
+
         logInfo(
           `[Path2] Result: success=${response.success}, error=${
             response.error || "none"
           }, isCaptcha=${response.isCaptcha}`
         );
+
+        // Log debug metadata if available (browser-host, elapsedMs, content-type)
+        if (response.debugMeta) {
+          const m = response.debugMeta;
+          logInfo(
+            `[Path2] Meta: host=${m.browserHost}, fetch=${(m.elapsedMs / 1000).toFixed(1)}s, total=${path2Elapsed}s, ct=${m.contentType}`
+          );
+        }
+
+        // Log body preview if non-SSE HTML was returned (WAF/blocking)
+        if (response.responseBodyPreview) {
+          logWarn(`[Path2] Body preview: ${response.responseBodyPreview.substring(0, 300)}`);
+        }
 
         // Even browser fetch can be blocked by WAF if the token/IP was flagged.
         // If we get WAF HTML back from inside browser, try resolveCaptchaAndRetry.
