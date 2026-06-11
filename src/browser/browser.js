@@ -277,6 +277,40 @@ export async function restartBrowserInHeadlessMode() {
   logInfo(success ? "Браузер перезапущен в фоновом режиме" : "Ошибка при перезапуске браузера");
 }
 
+export function getBrowserInstance() {
+  return browserInstance;
+}
+
+/**
+ * Saves cookies from all pages in the current browser session.
+ * Returns cookie array or null if browser not initialized.
+ */
+export async function saveBrowserCookies() {
+  try {
+    const baseCtx = getBrowserContext();
+    if (!baseCtx) return null;
+    // Get cookies from current page (they apply to the whole context)
+    return await baseCtx.cookies(CHAT_PAGE_URL);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Restores cookies to a browser context.
+ */
+export async function restoreBrowserCookies(page, cookies) {
+  if (!cookies || !page) return false;
+  try {
+    await page.setCookie(...cookies);
+    logInfo(`Восстановлено ${cookies.length} cookies`);
+    return true;
+  } catch (e) {
+    logWarn(`Не удалось восстановить cookies: ${e.message}`);
+    return false;
+  }
+}
+
 export async function shutdownBrowser() {
   try {
     try {

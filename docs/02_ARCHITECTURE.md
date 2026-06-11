@@ -161,29 +161,42 @@ flowchart TD
 | `parent_id.*not exist` | Retry same chat, reset parentId to null | No (null) | Yes | 1 |
 | `chat_not_exist` / `/not exist/i` | Create new chat via createChatV2 **with same token**, parentId=null, gated by `retryCount === 0` | No (null) | No (new) | 1 |
 | `"chat is in progress"` | Wait + retry **same** chat with same parentId | Yes | Yes | 3, then escalate to new-chat fallback |
-| `FAIL_SYS_USER_VALIDATE` (CAPTCHA) | Show visible browser, wait for user Enter, restart headless, retry same request preserving parentId + chatId | Yes | Yes | 2 |
+| `FAIL_SYS_USER_VALIDATE` (Qwen CAPTCHA) | Show headed browser, inject token, wait for user, restart headless, retry same request | Yes | Yes | 2 |
+| Aliyun WAF (`aliyun_waf` in body) | Same resolver as Qwen CAPTCHA — HTTP 200 HTML page with `aliyun_waf` meta tags detected across all response paths | Yes | Yes | 2 |
 
-## CAPTCHA resolution flow (S48, refactored S52)
+## CAPTCHA / WAF challenge resolution flow (S48, refactored S52)
 
-Qwen added a slider CAPTCHA (`FAIL_SYS_USER_VALIDATE`) that returns HTTP 200 with JSON error body containing `"action=captcha&punchCpatcha="...`. The response may claim `content-type: text/event-stream` but send either:
+**Two challenge types detected by the same resolver (via `isCaptchaChallenge()`):**
+
+### Qwen CAPTCHA (`FAIL_SYS_USER_VALIDATE`)
+Qwen added a slider CAPTCHA that returns HTTP 200 with JSON error body containing `"action=captcha&punchCpatcha="...`. The response may claim `content-type: text/event-stream` but send either:
 1. Immediate JSON error (detected via non-SSE parser)
 2. Empty stream that blocks forever — reader would hang for 60s until CDP timeout, deadlocking the page pool
 
 **Detection:** `parseNonSseCompletionBody()` detects `ret["FAIL_SYS_USER_VALIDATE"]` or `/captcha|punish/i` in body → maps to HTTP 503.
 
+### Aliyun WAF (`aliyun_waf`)
+Aliyun Web Application Firewall returns an HTML page with `<meta name="aliyun_waf_..">` tags instead of the expected SSE/JSON response. This is a browser-level verification that blocks API requests until the user passes the challenge in a headed browser.
+
+**Detection (3 paths):**
+- **Browser evaluate path:** Checks `body.includes("aliyun_waf")` before falling through to generic error
+- **Node.js streaming path:** `parseNonSseCompletionBody()` detects via `isCaptchaChallenge(body)`
+- **createChatV2 path:** Pre-checks content-type; if not JSON and body contains `aliyun_waf`, returns `{ isCaptcha: true }`
+
 **Resolution (centralized in `resolveCaptchaAndRetry()` since S52):**
-1. `sendMessage()` detects CAPTCHA (real `FAIL_SYS_USER_VALIDATE` or simulated via `SIMULATE_CAPTCHA=true`)
-2. `resolveCaptchaAndRetry()` handles full cycle:
+1. `sendMessage()` detects challenge via `isCaptchaChallenge(response.errorBody)` — triggers same resolver for both Qwen CAPTCHA and Aliyun WAF
+2. CLI message differs by type: "ЗАПРОШЕНА КАПЧА" vs "ЗАПРОШЕНА ВАРИФИКАЦИЯ WAF"
+3. `resolveCaptchaAndRetry()` handles full cycle:
    - Save JWT token from `getAuthToken()` before shutdown
    - `shutdownBrowser(headless)` + 2s delay
    - `initBrowser(visible=true, skipManualAuth=true)` — skip blocking auth flow
    - `page.goto(CHAT_PAGE_URL)` with `waitUntil: "domcontentloaded"` (S52 fix: was `networkidle2`, caused 60s timeout)
    - `page.evaluate(() => localStorage.setItem("token", savedToken))` — JWT inject for instant Qwen auth
-   - Wait for user Enter in console (slider CAPTCHA / verification)
+   - Wait for user Enter in console (slider CAPTCHA / WAF verification)
    - 3s delay → re-extract token from localStorage → update in proxy
    - `shutdownBrowser(visible)` + 2s delay → `initBrowser(headless=true)`
    - Retry `sendMessage(retryCount + 1)` preserving parentId + chatId
-3. If resolver already running or fails → fallback to 2 backoff attempts (5s/10s) before final error.
+4. If resolver already running or fails → fallback to 2 backoff attempts (5s/10s) before final error.
 
 **SIMULATE_CAPTCHA test mode (S52):** Set `SIMULATE_CAPTCHA=true` in `.env` or environment. Triggers exactly once per process (`_captchaSimulated` flag) on first request, returning `{ success: false, isCaptcha: true }`. Allows testing full resolver cycle without waiting for real Qwen CAPTCHA.
 
