@@ -206,16 +206,33 @@ const pagePool = {
         });
 
         // Extract token on fresh page if not yet cached.
+        // After headless restart, pages may be clean (no cookies/localStorage) even though we have tokens.
         const currentToken = getAuthToken();
-        if (!currentToken) {
+        let tokenFromBrowser = null;
+        try {
+          tokenFromBrowser = await newPage.evaluate(() => localStorage.getItem("token"));
+        } catch (e) {
+          /* ignore */
+        }
+
+        if (!currentToken && tokenFromBrowser) {
+          saveAuthToken(tokenFromBrowser);
+          logDebug("Токен авторизации получен из новой страницы в пуле");
+        } else if (tokenFromBrowser !== currentToken) {
+          // Token mismatch or one side is empty — sync them.
+          const tokenToUse = currentToken || tokenFromBrowser;
+          if (!currentToken && tokenToUse) saveAuthToken(tokenToUse);
+
           try {
-            const newToken = await newPage.evaluate(() => localStorage.getItem("token"));
-            if (newToken) {
-              saveAuthToken(newToken);
-              logDebug("Токен авторизации получен из новой страницы в пуле");
-            }
+            await newPage.evaluate((t) => localStorage.setItem("token", t), tokenToUse);
+            logDebug(
+              `Токен синхронизирован в странице: ${String(tokenToUse || "").slice(0, 20)}...`
+            );
+
+            // After writing JWT to localStorage, reload so Qwen sets session cookies based on it.
+            await newPage.reload({ waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT });
           } catch (e) {
-            // Token extraction failed on fresh page — not critical, token may be resolved later
+            logWarn(`Не удалось записать токен в страницу: ${e.message}`);
           }
         }
 
