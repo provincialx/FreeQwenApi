@@ -604,16 +604,17 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
       try {
         if (!data.token) return { success: false, error: "Токен авторизации не найден" };
 
+        // Debug info — defined outside try so catch-all can access them.
+        /* eslint-disable no-undef */
+        const startMs = Date.now();
+        const browserHostname = typeof location !== "undefined" ? location.hostname : "unknown";
+        const browserOrigin = typeof location !== "undefined" ? location.origin : "unknown";
+
         // AbortController: kill fetch() itself if it hangs >120s. Prevents indefinite CDP lock.
         const controller = new AbortController();
         const timeoutId = setTimeout(() => {
           controller.abort();
         }, 120_000);
-
-        // Debug info returned in case we hang at fetch()
-        const startMs = Date.now();
-        const browserHostname = typeof location !== "undefined" ? location.hostname : "unknown";
-        const browserOrigin = typeof location !== "undefined" ? location.origin : "unknown";
 
         // Use relative URL to keep same-origin — Qwen requires cookies from session.
         // If data.apiUrl is absolute (https://chat.qwen.ai/...), extract just path+query.
@@ -632,16 +633,47 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
         let response;
         try {
           response = await fetch(fetchUrl, {
-          method: "POST",
-          credentials: "include", // Send browser cookies — Qwen needs session, not just Bearer token
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${data.token}`,
-            Accept: "*/*",
-          },
-          body: JSON.stringify(data.payload),
-          signal: controller.signal,
-        }).finally(() => clearTimeout(timeoutId));
+            method: "POST",
+            credentials: "include", // Send browser cookies — Qwen needs session, not just Bearer token
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${data.token}`,
+              Accept: "*/*",
+            },
+            body: JSON.stringify(data.payload),
+            signal: controller.signal,
+          }).finally(() => clearTimeout(timeoutId));
+        } catch (error) {
+          // Return detailed diagnostic data so Node-side can log WHY fetch failed.
+          if (error?.name === "AbortError") {
+            return {
+              success: false,
+              error: `API request timed out after 120s`,
+              debugMeta: {
+                elapsedMs: Date.now() - startMs,
+                browserHost: browserHostname,
+                urlCalled: data.apiUrl.substring(0, 120),
+              },
+            };
+          }
+
+          // "Failed to fetch" diagnostics — tell Node-side what the page state was.
+          return {
+            success: false,
+            error: error.toString(),
+            debugMeta: {
+              elapsedMs: Date.now() - startMs,
+              browserHost: browserHostname,
+              browserOrigin: browserOrigin,
+              urlCalled: data.apiUrl.substring(0, 120),
+              fetchUrlRelative: fetchUrl,
+            },
+            diagnosticCookies: diagCookies || "none",
+            diagnosticStorageToken: diagStorageToken || "none",
+          };
+        }
+
+        // Success path continues here
 
         // Log response metadata for Node-side debugging
         const respMeta = {
@@ -740,32 +772,15 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
         const errorBody = await response.text();
         return { success: false, status: response.status, errorBody, debugMeta: respMeta };
       } catch (error) {
-        // Return detailed diagnostic data so Node-side can log WHY fetch failed.
-        if (error?.name === "AbortError") {
-          return {
-            success: false,
-            error: `API request timed out after 120s`,
-            debugMeta: {
-              elapsedMs: Date.now() - startMs,
-              browserHost: browserHostname,
-              urlCalled: data.apiUrl.substring(0, 120),
-            },
-          };
-        }
-
-        // "Failed to fetch" diagnostics — tell Node-side what the page state was.
+        // Catch-all for unexpected errors in browser-evaluate context.
         return {
           success: false,
-          error: error.toString(),
+          error: `Unexpected evaluate error: ${error.message || error.toString()}`,
           debugMeta: {
             elapsedMs: Date.now() - startMs,
             browserHost: browserHostname,
-            browserOrigin: browserOrigin,
             urlCalled: data.apiUrl.substring(0, 120),
-            fetchUrlRelative: fetchUrl,
           },
-          diagnosticCookies: diagCookies || "none",
-          diagnosticStorageToken: diagStorageToken || "none",
         };
       }
     },
@@ -1083,9 +1098,11 @@ export async function sendMessage(
         if (response.debugMeta) {
           const m = response.debugMeta;
           logInfo(
-            `[Path2] Meta: host=${m.browserHost}, origin=${m.browserOrigin || "N/A"}, fetch=${
-              (m.elapsedMs / 1000).toFixed(1)
-            }s, total=${path2Elapsed}s, ct=${m.contentType || "N/A"}, url=${m.fetchUrlRelative || m.urlCalled}`
+            `[Path2] Meta: host=${m.browserHost}, origin=${m.browserOrigin || "N/A"}, fetch=${(
+              m.elapsedMs / 1000
+            ).toFixed(
+              1
+            )}s, total=${path2Elapsed}s, ct=${m.contentType || "N/A"}, url=${m.fetchUrlRelative || m.urlCalled}`
           );
         }
 
