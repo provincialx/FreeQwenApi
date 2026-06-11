@@ -12,6 +12,14 @@
 | D6 | No integration/end-to-end tests — only unit tests | Regression testing requires manual smoke tests via running server | Unit suite (46 tests) covers pure logic functions well but not browser interaction, SSE delivery, or chat ID resolution end-to-end. Smoke test script exists (`scripts/smoke_test.js`) but needs live server + browser to run. |
 | D7 | CAPTCHA resolver requires manual console interaction | Visible browser + Enter key press blocks automated pipelines | S52 added `SIMULATE_CAPTCHA` for dev testing, but production CAPTCHA still needs human-in-the-loop. Consider auto-solver integration or headless CAPTCHA service if rate increases. |
 
+### Low priority (monitor)
+
+| # | Issue | Impact | Notes |
+|---|-------|--------|-------|
+| D8 | Node.js streaming path (`executeApiRequestWithNodeStreaming`) is dead code | Bloat, confusion for future developers | Aliyun WAF blocks all pure Node fetch. `sendMessage()` always calls `executeApiRequest()` via evaluateInBrowser. Consider extracting to deprecated folder or removing entirely after 2+ weeks of stable browser-only operation. |
+| D9 | Account cookies stored per-account but not loaded on headless startup | After restart, new pages may have no auth context until first request syncs token | Current workaround: pagePool's `getPage()` extracts token from localStorage and syncs with proxy state. Consider loading account cookies during browser init for faster cold-start authentication. |
+| D10 | Single global browser instance shared across all accounts | Cookie/token isolation relies on in-memory management, not separate profiles | Under heavy multi-account rotation, pages may mix auth contexts if timing is wrong (e.g., one page navigates while another extracts token). Consider `BrowserContext` per account if race conditions emerge. |
+
 ## Resolved issues archive (cross-reference)
 
 | # | Issue | Status | Session(s) resolved in |
@@ -20,6 +28,7 @@
 | ~~O2~~ | Streaming capture mode missing reasoning text before tool_call SSE chunks | ✅ RESOLVED — rewrite parseToolCallParts from Python fork. writeToolCallsSse sends reasoning chunk first then incremental tool_call deltas (~500 chars). OpenAI streaming-compliant format eliminates `tool input was not fully received` errors. | S18, S29 |
 | ~~O3~~ | Auto-Reset (Force Folding) mechanism needed to prevent context pollution in long agent-loops | ✅ RESOLVED — TOOL_CALL_RESET_THRESHOLD=8 triggers force-fold: keep head 5 + tail 10 + discard middle as statistics. Applied via `forceResetModels` Set checked at prepareOpenAIMessageInput entry point. Deferred reset via `inAgentLoop` flag prevents mid-loop invalidation that destroys context. | S10, S22 |
 | ~~O4~~ | `"chat is in progress"` race condition creates new chats immediately losing tool-calling context | ✅ RESOLVED — same-chat retry with backoff (~2s, ~4s) max 3 attempts before escalating to new chat fallback. Added 1s agent-loop cooldown delay before send to let Qwen SSE session settle. Prevents the old "create fresh chat → lose assistant.tool_calls history" path that caused 3-minute timeouts and tool calling failure. | S42 |
+| ~~O5~~ | Cross-account "not exist" errors during token rotation | ✅ RESOLVED — chatTokenOwner Map + resolveAuthToken(preferredOwnerId) binds each Qwen chat to its creating account. Token selection tries owner first before rotating. | S55 |
 
 ## Known behavioral quirks (not bugs, design trade-offs)
 
@@ -48,9 +57,11 @@ Queries matching `### Task:`, `History:` patterns get isolated into separate cha
 
 1. **No native OpenAI tools** — Qwen Chat Web API does not support `tools[]` in the request payload. Attempting to send them produces `"Tool X does not exists"` errors at the API level. Prompt injection + JSON post-parse roundtrip is the only viable path for tool calling through this proxy.
 
-2. **Browser fetch over Node.js HTTP** — Auth state (cookies, localStorage tokens) lives inside Chromium's browser context. Running requests via `page.evaluate(fetch)` preserves auth without needing cookie proxying or token refresh logic. Added complexity for marginal benefit to bypass.
+2. **Browser fetch exclusively** — Aliyun WAF blocks Node.js HTTP clients (returns HTML verification pages). All requests MUST run via `page.evaluate(fetch)` inside Chromium's browser context to pass WAF transparently. Auth state (cookies, localStorage tokens) lives inside Chromium's browser context anyway — browser evaluate preserves auth without needing cookie proxying or token refresh logic.
 
-3. **Python fork (`qwenfreeapi/`) deprecated as reference since S28** — Node.js version now has superior capabilities: better schema compaction with hard cap (Python sends raw schemas), complex anti-loop mechanisms (repeated calls, blocked tools), project context injection (anti-hallucination FS scan), modular architecture. Future development based on own experience + real-world testing with Zed Agent.
+3. **Page pool locks during generation** — When running SSE streams inside `evaluateInBrowser()`, the page is locked for the entire duration (up to 5 minutes). Pool size of 3 means max 3 concurrent requests. This is an inherent trade-off: WAF bypass requires browser context, which requires exclusive page ownership. Mitigated by `MAX_ACTIVE_PAGES=5` hard limit and `PAGE_POOL_SIZE=3` soft hint.
+
+4. **Python fork (`qwenfreeapi/`) deprecated as reference since S28** — Node.js version now has superior capabilities: better schema compaction with hard cap (Python sends raw schemas), complex anti-loop mechanisms (repeated calls, blocked tools), project context injection (anti-hallucination FS scan), modular architecture. Future development based on own experience + real-world testing with Zed Agent.
 
 ## API compatibility notes for external clients
 
