@@ -1004,54 +1004,27 @@ export async function sendMessage(
         : response?.isCaptcha
           ? "WAF challenge"
           : "HTML response";
-      logWarn(`🟡 Browser fallback forced: ${reason} → executeApiRequest`);
+      logWarn(`🟡 Browser fallback forced: ${reason} → executeApiRequest on main context`);
       try {
-        logInfo("⏳ Getting page from pool for browser fallback...");
-        page = await pagePool.getPage(browserContext);
-        logInfo("✅ Page acquired, executing API request in browser context...");
-
-        // Navigate to chat.qwen.ai if needed — origin mismatch breaks fetch.
-        const currentHost = await page.evaluate(() => location.hostname);
-        logDebug(`[Path2] Current host: ${currentHost}`);
-        if (currentHost !== "chat.qwen.ai") {
-          logDebug(`Navigating from ${currentHost} → ${CHAT_PAGE_URL}`);
-          await page.goto(CHAT_PAGE_URL, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT });
-
-          // Re-extract token after navigation (may differ if on different subdomain)
-          const extracted = await page.evaluate(() => localStorage.getItem("token"));
-          if (extracted && extracted !== cookieStr) {
-            logInfo("Токен обновлён после навигации для browser fallback");
-            setAuthToken(extracted);
-          }
-        } else {
-          // Page already on correct host — verify auth token freshness
-          const verificationNeeded = await checkVerification(page);
-          if (verificationNeeded) {
-            await page.reload({ waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT });
-          }
-        }
-
-        // Verify the page has session cookies — Qwen API requires them for browser-origin requests.
-        // A fresh pagePool-page without cookies will hang on fetch() even in browser context.
-        const cookieCount = (await page.cookies("https://chat.qwen.ai")).length;
-        logDebug(`[Path2] Page has ${cookieCount} cookies for chat.qwen.ai`);
-        if (cookieCount === 0) {
-          logWarn("⚠️ Path2 page has no cookies! Restoring from browser context...");
-          // Restore cookies from the main auth page
-          const basePage = getBrowserContext();
-          if (basePage) {
-            try {
-              const baseCookies = await basePage.cookies("https://chat.qwen.ai");
-              logDebug(`[Path2] Base page has ${baseCookies.length} cookies, restoring...`);
-              await page.setCookie(...baseCookies);
-            } catch (e) {
-              logWarn(`[Path2] Could not restore cookies: ${e.message}`);
-            }
-          }
+        // Use the main authenticated page directly.
+        // Ensure it's navigated and alive before evaluate — XHR fails if document isn't fully loaded!
+        try {
+          await browserContext.goto(CHAT_PAGE_URL, {
+            waitUntil: "domcontentloaded",
+            timeout: PAGE_TIMEOUT,
+          });
+        } catch {
+          /* ignore if already navigated */
         }
 
         const path2Start = Date.now();
-        response = await executeApiRequest(page, apiUrl, payload, getAuthToken(), onChunk);
+        response = await executeApiRequest(
+          browserContext,
+          apiUrl,
+          payload,
+          getAuthToken(),
+          onChunk
+        );
         const path2Elapsed = ((Date.now() - path2Start) / 1000).toFixed(1);
 
         logInfo(
@@ -1089,7 +1062,6 @@ export async function sendMessage(
         }
 
         // Even browser fetch can be blocked by WAF if the token/IP was flagged.
-        // If we get WAF HTML back from inside browser, try resolveCaptchaAndRetry.
         if (!response.success && response.errorBody) {
           const bodyStr = String(response.errorBody);
           if (isCaptchaChallenge(bodyStr)) {
@@ -1099,12 +1071,8 @@ export async function sendMessage(
             );
           }
         }
-
-        pagePool.releasePage(page);
-        page = null;
       } catch (err) {
-        logError("Browser fallback also failed", err);
-        if (page) pagePool.releasePage(page);
+        logError("Browser fallback on main context failed", err);
         return { error: `WAF fallback browser request failed: ${err.message}`, chatId };
       }
     } else if (
