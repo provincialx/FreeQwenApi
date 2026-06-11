@@ -631,154 +631,115 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
         const diagCookies = document.cookie.substring(0, 200); // truncate for safety
         const diagStorageToken = localStorage.getItem("token")?.substring(0, 30) + "...";
 
-        let response;
-        try {
-          response = await fetch(fetchUrl, {
-            method: "POST",
-            credentials: "include",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${data.token}`,
-              Accept: "*/*",
-              // Qwen API validates Sec-Fetch-* on server side.
-              // Missing these = silent block (non-200 response) even with valid token/cookies.
-              Origin: browserOrigin,
-              Referer: `${browserOrigin}/`,
-              "Sec-Fetch-Dest": "empty",
-              "Sec-Fetch-Mode": "cors",
-              "Sec-Fetch-Site": "same-origin",
-            },
-            body: JSON.stringify(data.payload),
-            signal: controller.signal,
-          }).finally(() => clearTimeout(timeoutId));
-        } catch (error) {
-          // Return detailed diagnostic data so Node-side can log WHY fetch failed.
-          if (error?.name === "AbortError") {
-            return {
-              success: false,
-              error: `API request timed out after 120s`,
-              debugMeta: {
-                elapsedMs: Date.now() - startMs,
-                browserHost: browserHostname,
-                urlCalled: data.apiUrl.substring(0, 120),
-              },
-            };
-          }
+        // Use XMLHttpRequest — Qwen Studio CSP blocks `fetch()` from evaluate() context.
+        const fullText = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("POST", fetchUrl);
 
-          // "Failed to fetch" diagnostics — tell Node-side what the page state was.
-          return {
-            success: false,
-            error: error.toString(),
-            debugMeta: {
-              elapsedMs: Date.now() - startMs,
-              browserHost: browserHostname,
-              browserOrigin: browserOrigin,
-              urlCalled: data.apiUrl.substring(0, 120),
-              fetchUrlRelative: fetchUrl,
-            },
-            diagnosticCookies: diagCookies || "none",
-            diagnosticStorageToken: diagStorageToken || "none",
+          xhr.setRequestHeader("Content-Type", "application/json");
+          xhr.setRequestHeader("Authorization", `Bearer ${data.token}`);
+          xhr.setRequestHeader("Accept", "*/*");
+          xhr.timeout = 120_000;
+
+          xhr.onload = () => {
+            resolve({
+              ok: xhr.status >= 200 && xhr.status < 300,
+              status: xhr.status,
+              headersText: xhr.getAllResponseHeaders(),
+              text: xhr.responseText,
+            });
           };
-        }
 
-        // Success path continues here
+          xhr.onerror = () => reject(new Error("XHR network error"));
+          xhr.ontimeout = () => controller.abort();
 
-        // Log response metadata for Node-side debugging
+          setTimeout(() => {
+            if (xhr.readyState < 4) {
+              xhr.abort();
+              reject(new DOMException("Timeout", "AbortError"));
+            }
+          }, 120_000).finally(() => clearTimeout(timeoutId));
+
+          xhr.send(JSON.stringify(data.payload));
+        });
+
+        // XHR response is already fully collected — parse SSE from text.
+        // Extract content-type header value from raw headers string.
+        let ctValue = "";
+        try {
+          for (const h of (fullText.headersText || "").split("\n")) {
+            if (h.toLowerCase().startsWith("content-type:")) {
+              ctValue = h.substring(13).trim();
+            }
+          }
+        } catch {}
+
         const respMeta = {
-          status: response.status,
-          contentType: response.headers.get("content-type") || "",
+          status: fullText.status,
+          contentType: ctValue,
           elapsedMs: Date.now() - startMs,
           browserHost: browserHostname,
           urlCalled: data.apiUrl.substring(0, 120),
         };
 
-        if (response.ok) {
-          const contentType = response.headers.get("content-type") || "";
+        if (fullText.ok) {
+          const contentType = respMeta.contentType;
           if (!contentType.includes("text/event-stream")) {
-            const bodyText = await response.text();
+            // Non-SSE response — parse as JSON or HTML.
             return {
-              ...parseNonSseCompletionBody(bodyText),
+              ...parseNonSseCompletionBody(fullText.text),
               debugMeta: respMeta,
-              responseBodyPreview: (bodyText || "").substring(0, 300),
+              responseBodyPreview: (fullText.text || "").substring(0, 300),
             };
           }
 
-          // SSE stream inside browser. Must collect fully because CDP is locked during this.
-          const reader = response.body?.getReader();
-          if (reader) {
-            let buffer = "",
-              fullContent = "",
-              responseId,
-              usage,
-              finished = false;
-
-            // AbortController: kill SSE read if Qwen hangs >3min. CDP is locked during evaluate,
-            // so without this the page stays blocked for REQUEST_TIMEOUT_MINUTES (5m+).
-            const abortTimeoutMs = 180_000; // 3 min
-            let sseTimer = null;
+          // Parse SSE from full text — XHR collected everything.
+          let fullContent = "",
+            responseId,
+            usage;
+          for (const line of fullText.text.split("\n")) {
+            const jsonStr = line.replace(/^data:\s?/, "").trim();
+            if (!jsonStr || jsonStr === "[DONE]") continue;
             try {
-              sseTimer = setTimeout(() => {
-                if (!finished) {
-                  finished = true;
-                  // Running inside page.evaluate — console.log goes to browser devtools.
-                  // Node.js side will see this as partial content return, not full [DONE].
-                  reader.cancel().catch(() => {});
-                }
-              }, abortTimeoutMs);
-
-              while (!finished) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                buffer += new TextDecoder().decode(value, { stream: true });
-                for (const line of buffer.split("\n")) {
-                  buffer = line.substring(line.lastIndexOf("\n") + 1);
-                  const jsonStr = line.replace(/^data:\s?/, "").trim();
-                  if (!jsonStr || jsonStr === "[DONE]") {
-                    if (jsonStr === "[DONE]") finished = true;
-                    continue;
-                  }
-                  try {
-                    const chunk = JSON.parse(jsonStr);
-                    if (chunk["response.created"])
-                      responseId = chunk["response.created"].response_id;
-                    const delta = chunk.choices?.[0]?.delta;
-                    if (delta?.content) fullContent += delta.content;
-                    if (delta?.status === "finished") finished = true;
-                    if (chunk.usage) usage = chunk.usage;
-                  } catch {}
-                }
-              }
-            } finally {
-              if (sseTimer) clearTimeout(sseTimer);
-            }
-
-            return {
-              success: true,
-              isTask: false,
-              data: {
-                id: responseId || `chatcmpl-${Date.now()}`,
-                object: "chat.completion",
-                created: Math.floor(Date.now() / 1000),
-                model: data.payload.model,
-                choices: [
-                  {
-                    index: 0,
-                    message: { role: "assistant", content: fullContent },
-                    finish_reason: "stop",
-                  },
-                ],
-                usage: usage || {
-                  prompt_tokens: 0,
-                  completion_tokens: 0,
-                  total_tokens: 0,
-                },
-              },
-            };
+              const chunk = JSON.parse(jsonStr);
+              if (chunk["response.created"]) responseId = chunk["response.created"].response_id;
+              const delta = chunk.choices?.[0]?.delta;
+              if (delta?.content) fullContent += delta.content;
+              if (chunk.usage) usage = chunk.usage;
+            } catch {}
           }
+
+          return {
+            success: true,
+            isTask: false,
+            data: {
+              id: responseId || `chatcmpl-${Date.now()}`,
+              object: "chat.completion",
+              created: Math.floor(Date.now() / 1000),
+              model: data.payload.model,
+              choices: [
+                {
+                  index: 0,
+                  message: { role: "assistant", content: fullContent },
+                  finish_reason: "stop",
+                },
+              ],
+              usage: usage || {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+              },
+            },
+            debugMeta: respMeta,
+          };
         }
 
-        const errorBody = await response.text();
-        return { success: false, status: response.status, errorBody, debugMeta: respMeta };
+        return {
+          success: false,
+          status: fullText.status,
+          errorBody: fullText.text,
+          debugMeta: respMeta,
+        };
       } catch (error) {
         // Catch-all for unexpected errors in browser-evaluate context.
         return {
