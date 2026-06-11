@@ -568,7 +568,47 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
         if (response.ok) {
           const contentType = response.headers.get("content-type") || "";
           if (!contentType.includes("text/event-stream")) {
-            return parseNonSseCompletionBody(await response.text());
+            // Inline parseNonSseCompletionBody so it runs in the browser context.
+            const body = await response.text();
+            try {
+              const parsed = JSON.parse(body);
+              const topLevelCode = parsed?.code;
+              const nestedCode = parsed?.data?.code;
+              const hasStructuredError =
+                parsed?.success === false ||
+                Boolean(parsed?.error) ||
+                Boolean(parsed?.data?.error) ||
+                Boolean(topLevelCode) ||
+                Boolean(nestedCode);
+
+              if (body.includes("FAIL_SYS_USER_VALIDATE")) {
+                return { success: false, isCaptcha: true, errorBody: body };
+              }
+
+              if (hasStructuredError) {
+                const isRateLimited =
+                  topLevelCode === "RateLimited" || nestedCode === "RateLimited";
+                return {
+                  success: false,
+                  status: isRateLimited ? 429 : 500,
+                  errorBody: body,
+                };
+              }
+
+              if (parsed.choices || parsed.id || (parsed.success === true && parsed.data)) {
+                return { success: true, isTask: false, data: parsed };
+              }
+            } catch {}
+
+            if (body && body.includes("FAIL_SYS_USER_VALIDATE")) {
+              return { success: false, isCaptcha: true, errorBody: body };
+            }
+
+            return {
+              success: false,
+              error: "Unexpected non-SSE 200 response",
+              errorBody: body,
+            };
           }
 
           // SSE stream in browser — collect into completion object
