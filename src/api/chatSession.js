@@ -1,7 +1,17 @@
 import crypto from "crypto";
 import { logInfo, logDebug } from "../logger/index.js";
 import { ALLOW_UNSCOPED_SESSION_CHAT_RESTORE } from "../config.js";
-import { createChatV2 } from "./chat.js";
+// Break circular dependency: chatSession → qwenApi → chatSession via dynamic import.
+// Synchronous createChatV2 import causes ESM module snapshot to return empty Maps when
+// qwenApi dynamically imports this module. Lazy getter ensures fully-initialized state.
+let _createChatV2 = null;
+async function getCreateChatV2() {
+  if (!_createChatV2) {
+    const mod = await import("./chat.js");
+    _createChatV2 = mod.createChatV2;
+  }
+  return _createChatV2;
+}
 import { getMappedModel } from "./modelMapping.js";
 
 // ─── Idempotency / Dedup Cache ────────────────────────────────────────────────
@@ -351,14 +361,14 @@ export function isChatNotExistError(result) {
 
 const chatIdMap = new Map();
 
-function mapChatId(generatedId, qwenChatId) {
+export function mapChatId(generatedId, qwenChatId) {
   if (generatedId) {
     chatIdMap.set(generatedId, qwenChatId);
     logDebug(`Маппинг чата: ${generatedId} -> ${qwenChatId}`);
   }
 }
 
-function getChatIdFromMap(generatedId) {
+export function getChatIdFromMap(generatedId) {
   return generatedId ? chatIdMap.get(generatedId) : null;
 }
 
@@ -413,10 +423,10 @@ export async function resolveQwenChatId(effectiveChatId, mappedModel) {
   }
 
   // Create new Qwen chat if we're still holding a proxy-generated ID and no default was found.
-  // defaultResolved === false means modelDefaultChats had no valid entry for this model
-  // (server restart, 24h expiry). Without creating here, the proxy-hash reaches Qwen → "not exist".
+  // Use lazy import to break circular dependency: chatSession → qwenApi (via chat.js) → chatSession.
   if (!defaultResolved && effectiveChatId?.startsWith("chat_") && qwenChatId === effectiveChatId) {
     try {
+      const createChatV2 = await getCreateChatV2();
       const created = await createChatV2(mappedModel, "Сессия OpenWebUI");
       if (created && created.chatId) {
         mapChatId(effectiveChatId, created.chatId);
@@ -485,14 +495,7 @@ export function saveChatIdForSession(req, chatId, parentId, scope = null) {
   logDebug(`Saved chatId ${chatId} for session ${sessionKey.substring(0, 8)}${scopeSuffix}`);
 }
 
-// ─── Chat ID Map Access ───────────────────────────────────────────────────────
-
-export function mapChatIdExport(generatedId, qwenChatId) {
-  if (generatedId) {
-    chatIdMap.set(generatedId, qwenChatId);
-    logDebug(`Маппинг чата: ${generatedId} -> ${qwenChatId}`);
-  }
-}
+// ─── Chat ID Map Access ──────────────────────────────────────────────
 
 // Expose forceResetModels for prepareOpenAIMessageInput
 export function getForceResetModels() {
@@ -517,7 +520,7 @@ export function persistSessionState(
 
   // Map generated export ID → Qwen internal ID
   if (effectiveChatId && effectiveChatId.startsWith("chat_") && resolvedChatId) {
-    mapChatIdExport(effectiveChatId, resolvedChatId);
+    mapChatId(effectiveChatId, resolvedChatId);
     logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${resolvedChatId}`);
   }
 

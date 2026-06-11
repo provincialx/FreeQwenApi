@@ -208,6 +208,7 @@ graph LR
 |-------|----------|---------------|---------|
 | Proxy wrapper | `REQUEST_TIMEOUT_MINUTES` | 5 min | Global request deadline via AbortController |
 | Browser evaluate | `apiTimeoutMs` | max(5×60+30, 180) = 330s | Timeout for `page.evaluate(fetch)` — long SSE inside browser |
+| **SSE reader abort** (S57) | `abortTimeoutMs` | **3 min** (inside evaluateInBrowser) | **Aborts reader if Qwen holds connection open >3min. Returns partial content instead of hanging CDP for 5m+** |
 | CDP protocol | `protocolTimeout` | (5+5) × 60 × 2 ≈ 180 min | Puppeteer connection limit — prevents "Protocol timeout" during long generations |
 
 ## Error retry policy

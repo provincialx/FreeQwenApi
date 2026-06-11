@@ -8,9 +8,9 @@ All core paths operational. 50+ development sessions across 5 days (June 7–11)
 |------|--------|-------|
 | Tool calling (SSE + streaming) | Working | Anti-loop guards, chunk splitting, parse reliability |
 | Agent-loop stability | Working | Deferred auto-reset, cooldown, same-chat retry on "in progress" |
-| Chat management | Working | S46: resolveQwenChatId creates chat when no default exists. invalidateQwenChatId cleans ALL maps on "not exist" error. |
+| Chat management | Working | S46: resolveQwenChatId creates chat when no default exists. invalidateQwenChatId cleans ALL maps on "not exist" error. Early mapChatId (S57) saves mapping before SSE timeout loses it. |
 | Page pool memory | Mitigated | Hard limit 5 pages, idle TTL 5min, periodic GC every 60s, Memory Guard RSS restart |
-| Timeout enforcement | Active | `REQUEST_TIMEOUT_MINUTES` (5m) wrapper + protocolTimeout synced at ~180s+ CDP limit |
+| Timeout enforcement | Active | `REQUEST_TIMEOUT_MINUTES` (5m) wrapper + protocolTimeout synced at ~180s+ CDP limit. SSE reader abort 3min (S57). |
 | CAPTCHA resolver | Working | S52: centralized `resolveCaptchaAndRetry()`, JWT inject, `SIMULATE_CAPTCHA` test mode |
 | Unit tests | Passing | 46/46 (`npm test`) |
 | ESLint | Clean | 0 errors, ~37 warnings (known unused imports — tech-debt) |

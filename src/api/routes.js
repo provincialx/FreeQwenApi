@@ -32,7 +32,7 @@ import {
   getModelDefaultChats,
   TOOL_CALL_RESET_THRESHOLD,
   persistSessionState,
-  mapChatId as chatMapChatId,
+  mapChatId,
   getChatTokenOwner,
 } from "./chatSession.js";
 
@@ -305,6 +305,13 @@ router.post("/chat/completions", async (req, res) => {
 
       try {
         const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+
+        // Persist ownership immediately after resolution so timeout doesn't lose the mapping.
+        // When Qwen SSE hangs >5m, persistSessionState never runs → next request recreates chat.
+        if (qwenChatId && effectiveChatId && effectiveChatId.startsWith("chat_") && !isMeta) {
+          mapChatId(effectiveChatId, qwenChatId);
+          logDebug(`Маппинг сохранён при разрешении чата: ${effectiveChatId} -> ${qwenChatId}`);
+        }
 
         // Setup streaming callback if stream=true
         let streamingCallback = null;

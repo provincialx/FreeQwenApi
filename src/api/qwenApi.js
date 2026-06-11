@@ -585,26 +585,44 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
               usage,
               finished = false;
 
-            while (!finished) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              buffer += new TextDecoder().decode(value, { stream: true });
-              for (const line of buffer.split("\n")) {
-                buffer = line.substring(line.lastIndexOf("\n") + 1);
-                const jsonStr = line.replace(/^data:\s?/, "").trim();
-                if (!jsonStr || jsonStr === "[DONE]") {
-                  if (jsonStr === "[DONE]") finished = true;
-                  continue;
+            // AbortController: kill SSE read if Qwen hangs >3min. CDP is locked during evaluate,
+            // so without this the page stays blocked for REQUEST_TIMEOUT_MINUTES (5m+).
+            const abortTimeoutMs = 180_000; // 3 min
+            let sseTimer = null;
+            try {
+              sseTimer = setTimeout(() => {
+                if (!finished) {
+                  finished = true;
+                  // Running inside page.evaluate — console.log goes to browser devtools.
+                  // Node.js side will see this as partial content return, not full [DONE].
+                  reader.cancel().catch(() => {});
                 }
-                try {
-                  const chunk = JSON.parse(jsonStr);
-                  if (chunk["response.created"]) responseId = chunk["response.created"].response_id;
-                  const delta = chunk.choices?.[0]?.delta;
-                  if (delta?.content) fullContent += delta.content;
-                  if (delta?.status === "finished") finished = true;
-                  if (chunk.usage) usage = chunk.usage;
-                } catch {}
+              }, abortTimeoutMs);
+
+              while (!finished) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += new TextDecoder().decode(value, { stream: true });
+                for (const line of buffer.split("\n")) {
+                  buffer = line.substring(line.lastIndexOf("\n") + 1);
+                  const jsonStr = line.replace(/^data:\s?/, "").trim();
+                  if (!jsonStr || jsonStr === "[DONE]") {
+                    if (jsonStr === "[DONE]") finished = true;
+                    continue;
+                  }
+                  try {
+                    const chunk = JSON.parse(jsonStr);
+                    if (chunk["response.created"])
+                      responseId = chunk["response.created"].response_id;
+                    const delta = chunk.choices?.[0]?.delta;
+                    if (delta?.content) fullContent += delta.content;
+                    if (delta?.status === "finished") finished = true;
+                    if (chunk.usage) usage = chunk.usage;
+                  } catch {}
+                }
               }
+            } finally {
+              if (sseTimer) clearTimeout(sseTimer);
             }
 
             return {
@@ -899,7 +917,6 @@ export async function sendMessage(
 
     const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
     const response = await executeApiRequest(page, apiUrl, payload, getAuthToken(), onChunk);
-
     pagePool.releasePage(page);
     page = null;
 
