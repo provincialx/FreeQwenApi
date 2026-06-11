@@ -66,11 +66,18 @@ graph TB
 
 ### Path 2: Browser Evaluate (Fallback)
 
-Activated ONLY when Node.js response contains `aliyun_waf` markers:
+Activated when ANY Node-streaming failure occurs (`forceBrowserFallback`):
+1. **Path 1 exception** — `TypeError: terminated`, network errors, etc.
+2. **WAF challenge detected** — `isCaptcha` flag from response
+3. **Non-SSE HTML response** — WAF markers found in raw body via `isCaptchaChallenge()`
+
+When activated:
 - Validates page hostname → navigates to chat.qwen.ai if needed
 - Re-extracts token from localStorage after navigation
 - Runs full `evaluateInBrowser(fetch)` with SSE reader inside Chromium tab
 - Locks CDP for up to 3 minutes (SSE reader abort timeout)
+
+**Why force browser on exception?** When WAF blocks Node-fetch, subsequent retries from the same IP/token are also blocked. The only viable path is running fetch() inside the authenticated browser context where WAF trusts the origin.
 
 **Before S59:** All requests went through browser-evaluate, blocking CDP for the entire generation duration. This caused Zed Agent to timeout when fetch failed inside browser context.
 
@@ -256,7 +263,8 @@ graph LR
 | `chat_not_exist` / `/not exist/i` | Create new chat via createChatV2 **with same token**, parentId=null, gated by `retryCount === 0` | No (null) | No (new) | 1 |
 | `"chat is in progress"` | Wait + retry **same** chat with same parentId | Yes | Yes | 3, then escalate to new-chat fallback |
 | `FAIL_SYS_USER_VALIDATE` (Qwen CAPTCHA) | Show headed browser, inject token, wait for user, restart headless, retry same request | Yes | Yes | 2 |
-| Aliyun WAF (`aliyun_waf` in body) | Same resolver as Qwen CAPTCHA — HTTP 200 HTML page with `aliyun_waf` meta tags detected across all response paths | Yes | Yes | 2 |
+| Aliyun WAF (WAF challenge markers) | Force browser fallback — Node-fetch blocked, run inside Chromium context. Also triggers on stream exceptions (`TypeError: terminated`) | Yes | Yes (forced) | N/A (force path) |
+| `FAIL_SYS_USER_VALIDATE` + HTML WAF page | If browser fallback also returns CAPTCHA → headed resolver (`resolveCaptchaAndRetry`) | Yes | Yes | 2 |
 
 ## CAPTCHA / WAF challenge resolution flow (S48, refactored S52)
 
@@ -271,27 +279,39 @@ Qwen added a slider CAPTCHA that returns HTTP 200 with JSON error body containin
 
 > **⚠ Browser context constraint (S58):** Functions inside `page.evaluate()` run in Chromium's JS engine, NOT Node.js. Puppeteer serializes only the callback body — external function references throw `ReferenceError: xxx is not defined`. Hence `parseNonSseInBrowser()` must be defined INSIDE the evaluate callback for proper serialization.
 
-### Aliyun WAF (`aliyun_waf`)
-Aliyun Web Application Firewall returns an HTML page with `<meta name="aliyun_waf_..">` tags instead of the expected SSE/JSON response. This is a browser-level verification that blocks API requests until the user passes the challenge in a headed browser.
+### Aliyun WAF (Challenge Page Detection)
+Aliyun Web Application Firewall returns an HTML challenge page instead of the expected SSE/JSON response. Node.js `fetch()` is detected as automated and blocked; fetch() must run inside authenticated browser context to pass.
 
-**Detection (3 paths):**
+**Detection markers (`isCaptchaChallenge()`):**
+1. `FAIL_SYS_USER_VALIDATE` — old Qwen CAPTCHA token (still present in some challenges)
+2. `name="aliyun_waf` or `name='aliyun_waf` — HTML meta tag from WAF challenge page
+3. `_waf_is_mob` or `_wa1_is_mob` — JavaScript variable names injected by WAF
+4. `void 0===window.console` — console override script in WAF challenge
+5. `background:#fff` + `aliyun` — inline style signature of blocked state
+
+**Detection paths:**
 - **Browser evaluate path:** Checks `body.includes("aliyun_waf")` before falling through to generic error
-- **Node.js streaming path:** `parseNonSseCompletionBody()` detects via `isCaptchaChallenge(body)`
-- **createChatV2 path:** Pre-checks content-type; if not JSON and body contains `aliyun_waf`, returns `{ isCaptcha: true }`
+- **Node.js streaming path:** `parseNonSseCompletionBody()` → `isCaptchaChallenge(body)`
+- **createChatV2 path:** Pre-checks content-type; if not JSON and body contains WAF markers, returns `{ isCaptcha: true }`
+- **Stream exceptions:** When Node-streaming throws (`TypeError: terminated`), browser fallback forced
 
-**Resolution (centralized in `resolveCaptchaAndRetry()` since S52):**
-1. `sendMessage()` detects challenge via `isCaptchaChallenge(response.errorBody)` — triggers same resolver for both Qwen CAPTCHA and Aliyun WAF
-2. CLI message differs by type: "ЗАПРОШЕНА КАПЧА" vs "ЗАПРОШЕНА ВАРИФИКАЦИЯ WAF"
-3. `resolveCaptchaAndRetry()` handles full cycle:
-   - Save JWT token from `getAuthToken()` before shutdown
-   - `shutdownBrowser(headless)` + 2s delay
-   - `initBrowser(visible=true, skipManualAuth=true)` — skip blocking auth flow
-   - `page.goto(CHAT_PAGE_URL)` with `waitUntil: "domcontentloaded"` (S52 fix: was `networkidle2`, caused 60s timeout)
-   - `evaluateInBrowser(() => localStorage.setItem("token", savedToken))` — JWT inject for instant Qwen auth
-   - Wait for user Enter in console (slider CAPTCHA / WAF verification)
-   - 3s delay → re-extract token from localStorage → update in proxy
-   - `shutdownBrowser(visible)` + 2s delay → `initBrowser(headless=true)`
-   - Retry `sendMessage(retryCount + 1)` preserving parentId + chatId
+**Two-tier resolution:**
+1. **Tier 1 — Force browser fallback (automatic):** `forceBrowserFallback` triggers when Path 1 fails. Runs `executeApiRequest()` inside Chromium tab where WAF trusts the origin.
+2. **Tier 2 — Headed resolver (`resolveCaptchaAndRetry`):** If Tier 1 also returns CAPTCHA, show headed browser for manual verification.
+
+**Headed resolver cycle:**
+- `sendMessage()` detects challenge via `isCaptchaChallenge(response.errorBody)` or `response.isCaptcha`
+- CLI message differs by type: "ЗАПРОШЕНА КАПЧА" vs "ЗАПРОШЕНА ВАРИФИКАЦИЯ WAF"
+- `resolveCaptchaAndRetry()` handles full cycle:
+  - Save JWT token from `getAuthToken()` before shutdown
+  - `shutdownBrowser(headless)` + 2s delay
+  - `initBrowser(visible=true, skipManualAuth=true)` — skip blocking auth flow
+  - `page.goto(CHAT_PAGE_URL)` with `waitUntil: "domcontentloaded"` (S52 fix: was `networkidle2`, caused 60s timeout)
+  - `evaluateInBrowser(() => localStorage.setItem("token", savedToken))` — JWT inject for instant Qwen auth
+  - Wait for user Enter in console (slider CAPTCHA / WAF verification)
+  - 3s delay → re-extract token from localStorage → update in proxy
+  - `shutdownBrowser(visible)` + 2s delay → `initBrowser(headless=true)`
+  - Retry `sendMessage(retryCount + 1)` preserving parentId + chatId
 4. If resolver already running or fails → fallback to 2 backoff attempts (5s/10s) before final error.
 
 **SIMULATE_CAPTCHA test mode (S52):** Set `SIMULATE_CAPTCHA=true` in `.env` or environment. Triggers exactly once per process (`_captchaSimulated` flag) on first request, returning `{ success: false, isCaptcha: true }`. Allows testing full resolver cycle without waiting for real Qwen CAPTCHA.

@@ -58,10 +58,24 @@ async function promptUser(message) {
   });
 }
 
-// ─── CAPTCHA detection ────────────────────────────────────────────────────────
+// ─── WAF/CAPTCHA detection ────────────────────────────────────────────
+// Aliyun WAF uses multiple signals. Check all known markers.
 function isCaptchaChallenge(errorBody) {
   const body = errorBody || "";
-  return body.includes("FAIL_SYS_USER_VALIDATE");
+
+  // Old structured CAPTCHA token
+  if (body.includes("FAIL_SYS_USER_VALIDATE")) return true;
+
+  // New Aliyun WAF HTML challenge page — non-JSON response from Node fetch.
+  // Markers: <meta name="aliyun_waf_aa">, _waf_ JS vars, console override script
+  if (body.includes('name="aliyun_waf') || body.includes("name='aliyun_waf")) return true;
+  if (body.includes("_waf_is_mob") || body.includes("_wa1_is_mob")) return true;
+  if (body.includes("void 0===window.console")) return true;
+
+  // Response is HTML with WAF-like inline styles designed to block bots
+  if (body.toLowerCase().includes("background:#fff") && body.includes("aliyun")) return true;
+
+  return false;
 }
 
 /** Show headed browser for user to solve CAPTCHA, refresh token, then retry. */
@@ -916,18 +930,32 @@ export async function sendMessage(
   logInfo(`🟢 Node-streaming (path 1): чат ${chatId}, parent: ${parentId || "null"}`);
   const cookieStr = getAuthToken();
   logInfo(`🔍 [S59_CODE_V2] Two-path strategy active`);
+  let path1Failed = false;
   try {
     response = await executeApiRequestWithNodeStreaming(apiUrl, payload, cookieStr, onChunk);
     logDebug(`[Path1] Result: success=${response.success}, isCaptcha=${response.isCaptcha}`);
   } catch (err) {
     logWarn(`Node-streaming failed: ${err.message}`);
+    path1Failed = true;
   }
 
-  try {
-    // ── Path 2: Browser fallback — only when WAF blocks Node path ───────────
-    if (response && !response.success && isCaptchaChallenge(response.errorBody)) {
-      logWarn("🟡 Aliyun WAF blocked Node-streaming → browser-evaluate fallback (path 2)");
+  // ── Force browser fallback when Node fetch can't reach Qwen API ───────
+  // WAF blocks ALL subsequent Node-fetch from this IP/token. Retrying Node path is futile.
+  // Also covers "Токен авторизации" errors — browser can extract token from localStorage.
+  const forceBrowserFallback =
+    path1Failed ||
+    (response && !response.success && response.isCaptcha) ||
+    (response && !response.success && isCaptchaChallenge(response.errorBody));
 
+  try {
+    // ── Path 2: Browser fallback — forced when WAF blocks Node fetch ─────────
+    if (forceBrowserFallback) {
+      const reason = path1Failed
+        ? "Path1 exception"
+        : response?.isCaptcha
+          ? "WAF challenge"
+          : "HTML response";
+      logWarn(`🟡 Browser fallback forced: ${reason} → executeApiRequest`);
       try {
         page = await pagePool.getPage(browserContext);
 
@@ -960,38 +988,15 @@ export async function sendMessage(
         return { error: `WAF fallback browser request failed: ${err.message}`, chatId };
       }
     } else if (
+      !forceBrowserFallback &&
       response &&
       !response.success &&
       response.error &&
       response.error.includes("Токен авторизации")
     ) {
-      // Token not found or invalid — try browser path to extract it from localStorage
+      // Token missing — browser fallback is already covered by forceBrowserFallback.
+      // This branch handles the rare case of direct token error without WAF.
       logWarn("Токен отсутствует или невалиден → получение из браузера");
-      try {
-        page = await pagePool.getPage(browserContext);
-        const currentHost = await page.evaluate(() => location.hostname);
-        if (currentHost !== "chat.qwen.ai") {
-          await page.goto(CHAT_PAGE_URL, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT });
-        }
-
-        setAuthToken(await page.evaluate(() => localStorage.getItem("token")));
-        if (!getAuthToken()) {
-          pagePool.releasePage(page);
-          return {
-            error: "Токен авторизации не найден. Требуется перезапуск в ручном режиме.",
-            chatId,
-          };
-        }
-        saveAuthToken(getAuthToken());
-
-        response = await executeApiRequest(page, apiUrl, payload, getAuthToken(), onChunk);
-        pagePool.releasePage(page);
-        page = null;
-      } catch (err) {
-        logError("Browser token-extraction failed", err);
-        if (page) pagePool.releasePage(page);
-        return { error: `Token extraction from browser failed: ${err.message}`, chatId };
-      }
     }
 
     // ── Shared response handling (both paths converge here) ───────────────────
@@ -1043,14 +1048,10 @@ export async function sendMessage(
         onChunk
       );
 
+      const errText = (response.errorBody || "").toLowerCase();
+
       // Distinguish between parent_id not exist and chat not exist.
-      // "parent_id X is not exist" means the stale parentId was cached — just reset it.
-      // True chat_not_exist errors don't mention parent_id specifically.
-      if (
-        response.errorBody &&
-        /not exist/i.test(response.errorBody) &&
-        /parent_id/i.test(response.errorBody)
-      ) {
+      if (errText.includes("not exist") && errText.includes("parent_id")) {
         logWarn(`Stale parentId ${parentId} — retry without it on chat ${chatId}`);
         if (retryCount < 1) {
           const retryResult = await sendMessage(
@@ -1069,8 +1070,8 @@ export async function sendMessage(
         }
       }
 
-      // Only allow ONE new-chat creation on "not exist" to prevent infinite loop.
-      if (response.errorBody && /not exist/i.test(response.errorBody) && retryCount === 0) {
+      // Only allow ONE new-chat creation on "not exist" — prevent infinite loop.
+      if (errText.includes("not exist") && retryCount === 0) {
         logWarn(`Qwen чат ${chatId} больше не существует. Создаю новый и повторяю запрос...`);
 
         // Invalidate stale mappings BEFORE creating new chat so next request doesn't reuse dead ID.
@@ -1103,7 +1104,7 @@ export async function sendMessage(
       // Creating a new chat during agent-loop destroys context — Qwen loses
       // assistant.tool_calls history and generates explanatory text instead of continuation.
       // Only escalate to new-chat if same-chat retries exhaust (Qwen truly stuck).
-      const isInProgress = response.errorBody && /chat is in progress/i.test(response.errorBody);
+      const isInProgress = errText.includes("chat is in progress");
       if (isInProgress) {
         if (retryCount < 3) {
           // Backoff: ~2s, ~4s — Qwen SSE session usually finishes in 1-5s after
