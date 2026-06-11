@@ -601,13 +601,14 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
   return evaluateInBrowser(
     page,
     async (data) => {
+      // Define diagnostics vars BEFORE try so catch-block always has them.
+      /* eslint-disable no-undef */
+      const startMs = Date.now();
+      const browserHostname = typeof location !== "undefined" ? location.hostname : "unknown";
+
       try {
         if (!data.token) return { success: false, error: "Токен авторизации не найден" };
 
-        // Debug info — defined outside try so catch-all can access them.
-        /* eslint-disable no-undef */
-        const startMs = Date.now();
-        const browserHostname = typeof location !== "undefined" ? location.hostname : "unknown";
         const browserOrigin = typeof location !== "undefined" ? location.origin : "unknown";
 
         // AbortController: kill fetch() itself if it hangs >120s. Prevents indefinite CDP lock.
