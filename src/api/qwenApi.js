@@ -915,8 +915,10 @@ export async function sendMessage(
 
   logInfo(`🟢 Node-streaming (path 1): чат ${chatId}, parent: ${parentId || "null"}`);
   const cookieStr = getAuthToken();
+  logInfo(`🔍 [S59_CODE_V2] Two-path strategy active`);
   try {
     response = await executeApiRequestWithNodeStreaming(apiUrl, payload, cookieStr, onChunk);
+    logDebug(`[Path1] Result: success=${response.success}, isCaptcha=${response.isCaptcha}`);
   } catch (err) {
     logWarn(`Node-streaming failed: ${err.message}`);
   }
