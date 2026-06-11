@@ -378,8 +378,8 @@ function parseNonSseCompletionBody(body) {
     // Ignore parse errors here and return a generic failure below.
   }
 
-  // CAPTCHA detection at raw text level as final fallback.
-  if (body && body.includes("FAIL_SYS_USER_VALIDATE")) {
+  // WAF/CAPTCHA detection at raw text level — final fallback.
+  if (isCaptchaChallenge(body)) {
     return { success: false, isCaptcha: true, errorBody: body };
   }
 
