@@ -613,6 +613,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
         // Debug info returned in case we hang at fetch()
         const startMs = Date.now();
         const browserHostname = typeof location !== "undefined" ? location.hostname : "unknown";
+        const browserOrigin = typeof location !== "undefined" ? location.origin : "unknown";
 
         // Use relative URL to keep same-origin — Qwen requires cookies from session.
         // If data.apiUrl is absolute (https://chat.qwen.ai/...), extract just path+query.
@@ -624,7 +625,13 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
           } catch {}
         }
 
-        const response = await fetch(fetchUrl, {
+        // DIAGNOSTIC: Collect browser state before fetch to understand failures.
+        const diagCookies = document.cookie.substring(0, 200); // truncate for safety
+        const diagStorageToken = localStorage.getItem("token")?.substring(0, 30) + "...";
+
+        let response;
+        try {
+          response = await fetch(fetchUrl, {
           method: "POST",
           credentials: "include", // Send browser cookies — Qwen needs session, not just Bearer token
           headers: {
@@ -731,10 +738,35 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
         }
 
         const errorBody = await response.text();
-        return { success: false, status: response.status, errorBody };
+        return { success: false, status: response.status, errorBody, debugMeta: respMeta };
       } catch (error) {
-        if (error?.name === "AbortError") return { success: false, error: `API request timed out` };
-        return { success: false, error: error.toString() };
+        // Return detailed diagnostic data so Node-side can log WHY fetch failed.
+        if (error?.name === "AbortError") {
+          return {
+            success: false,
+            error: `API request timed out after 120s`,
+            debugMeta: {
+              elapsedMs: Date.now() - startMs,
+              browserHost: browserHostname,
+              urlCalled: data.apiUrl.substring(0, 120),
+            },
+          };
+        }
+
+        // "Failed to fetch" diagnostics — tell Node-side what the page state was.
+        return {
+          success: false,
+          error: error.toString(),
+          debugMeta: {
+            elapsedMs: Date.now() - startMs,
+            browserHost: browserHostname,
+            browserOrigin: browserOrigin,
+            urlCalled: data.apiUrl.substring(0, 120),
+            fetchUrlRelative: fetchUrl,
+          },
+          diagnosticCookies: diagCookies || "none",
+          diagnosticStorageToken: diagStorageToken || "none",
+        };
       }
     },
     [requestBody],
@@ -1051,8 +1083,21 @@ export async function sendMessage(
         if (response.debugMeta) {
           const m = response.debugMeta;
           logInfo(
-            `[Path2] Meta: host=${m.browserHost}, fetch=${(m.elapsedMs / 1000).toFixed(1)}s, total=${path2Elapsed}s, ct=${m.contentType}`
+            `[Path2] Meta: host=${m.browserHost}, origin=${m.browserOrigin || "N/A"}, fetch=${
+              (m.elapsedMs / 1000).toFixed(1)
+            }s, total=${path2Elapsed}s, ct=${m.contentType || "N/A"}, url=${m.fetchUrlRelative || m.urlCalled}`
           );
+        }
+
+        // Log diagnostic browser state if fetch failed (cookies, localStorage token)
+        if (!response.success && response.diagnosticCookies) {
+          logWarn(
+            `[Path2] Diag cookies: "${response.diagnosticCookies.substring(0, 150)}"
+`
+          );
+        }
+        if (!response.success && response.diagnosticStorageToken) {
+          logWarn(`[Path2] Diag localStorage token: ${response.diagnosticStorageToken}`);
         }
 
         // Log body preview if non-SSE HTML was returned (WAF/blocking)
