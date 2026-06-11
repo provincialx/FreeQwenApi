@@ -355,6 +355,11 @@ function parseNonSseCompletionBody(body) {
       Boolean(topLevelCode) ||
       Boolean(nestedCode);
 
+    // CAPTCHA can appear in structured error JSON too, check before other errors.
+    if (body.includes("FAIL_SYS_USER_VALIDATE")) {
+      return { success: false, isCaptcha: true, errorBody: body };
+    }
+
     if (hasStructuredError) {
       const isRateLimited = topLevelCode === "RateLimited" || nestedCode === "RateLimited";
       return {
@@ -371,7 +376,7 @@ function parseNonSseCompletionBody(body) {
     // Ignore parse errors here and return a generic failure below.
   }
 
-  // CAPTCHA detection at parse level — ensure we catch it regardless of which path returns this.
+  // CAPTCHA detection at raw text level as final fallback.
   if (body && body.includes("FAIL_SYS_USER_VALIDATE")) {
     return { success: false, isCaptcha: true, errorBody: body };
   }
@@ -530,188 +535,102 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
   }
 }
 
+// Use Node.js fetch for all API calls — evaluateInBrowser is unreliable on Qwen.
 async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
-  if (payload?.stream !== false && typeof onChunk === "function") {
-    const streamedResponse = await executeApiRequestWithNodeStreaming(
-      apiUrl,
-      payload,
-      token,
-      onChunk
-    );
-
-    const canReturnDirectly =
-      streamedResponse.success ||
-      Boolean(streamedResponse.status) ||
-      Boolean(streamedResponse.errorBody) ||
-      streamedResponse.hasStreamedChunks === true;
-
-    if (canReturnDirectly) {
-      return streamedResponse;
-    }
-
-    logWarn(
-      `Node-streaming недоступен (${streamedResponse.error || "unknown error"}), fallback к browser fetch.`
-    );
-  }
-
-  const requestBody = { apiUrl, payload, token };
-
   logDebug(`Используем токен: ${token ? "Токен существует" : "Токен отсутствует"}`);
   logDebug(`API URL: ${apiUrl}`);
 
+  // Try Node.js fetch first (works for both streaming and non-streaming)
+  if (typeof fetch === "function") {
+    const response = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk);
+
+    const canReturnDirectly =
+      response.success ||
+      Boolean(response.status) ||
+      Boolean(response.errorBody) ||
+      response.hasStreamedChunks === true;
+
+    if (canReturnDirectly) {
+      return response;
+    }
+
+    logWarn(
+      `Node-fetch недоступен (${response.error || "unknown error"}), fallback к browser fetch.`
+    );
+  }
+
+  // Fallback: execute in browser context (should rarely be needed)
+  const requestBody = { apiUrl, payload, token };
   return evaluateInBrowser(
     page,
     async (data) => {
       try {
-        const t = data.token;
-        if (!t) return { success: false, error: "Токен авторизации не найден" };
+        if (!data.token) return { success: false, error: "Токен авторизации не найден" };
 
         const response = await fetch(data.apiUrl, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${t}`,
+            Authorization: `Bearer ${data.token}`,
             Accept: "*/*",
           },
           body: JSON.stringify(data.payload),
         });
 
         if (response.ok) {
-          if (data.payload.stream === false) {
-            const jsonResponse = await response.json();
-            if (jsonResponse.code === "RateLimited" || jsonResponse.error) {
-              return {
-                success: false,
-                status: 429,
-                errorBody: JSON.stringify(jsonResponse),
-              };
-            }
-            return { success: true, isTask: true, data: jsonResponse };
+          const contentType = response.headers.get("content-type") || "";
+          if (!contentType.includes("text/event-stream")) {
+            return parseNonSseCompletionBody(await response.text());
           }
 
-          const contentType = response.headers.get("content-type") || "";
-
-          if (!contentType.includes("text/event-stream")) {
-            const body = await response.text();
-            try {
-              const parsed = JSON.parse(body);
-              const topLevelCode = parsed?.code;
-              const nestedCode = parsed?.data?.code;
-              const hasStructuredError =
-                parsed?.success === false ||
-                Boolean(parsed?.error) ||
-                Boolean(parsed?.data?.error) ||
-                Boolean(topLevelCode) ||
-                Boolean(nestedCode);
-
-              // CAPTCHA can be in structured error too.
-              if (hasStructuredError && body.includes("FAIL_SYS_USER_VALIDATE")) {
-                return { success: false, isCaptcha: true, errorBody: body };
+          // SSE stream in browser — collect into completion object
+          const reader = response.body?.getReader?.();
+          if (reader) {
+            let buffer = "",
+              fullContent = "",
+              responseId,
+              usage,
+              finished = false;
+            while (!finished) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += new TextDecoder().decode(value, { stream: true });
+              for (const line of buffer.split("\n")) {
+                buffer = line.substring(line.lastIndexOf("\n") + 1);
+                const jsonStr = line.replace(/^data:\s?/, "").trim();
+                if (!jsonStr || jsonStr === "[DONE]") {
+                  if (jsonStr === "[DONE]") finished = true;
+                  continue;
+                }
+                try {
+                  const chunk = JSON.parse(jsonStr);
+                  if (chunk["response.created"]) responseId = chunk["response.created"].response_id;
+                  const delta = chunk.choices?.[0]?.delta;
+                  if (delta?.content) fullContent += delta.content;
+                  if (delta?.status === "finished") finished = true;
+                  if (chunk.usage) usage = chunk.usage;
+                } catch {}
               }
-
-              if (hasStructuredError) {
-                const isRateLimited =
-                  topLevelCode === "RateLimited" || nestedCode === "RateLimited";
-                return {
-                  success: false,
-                  status: isRateLimited ? 429 : 500,
-                  errorBody: body,
-                };
-              }
-
-              if (parsed.choices || parsed.id || (parsed.success === true && parsed.data)) {
-                return { success: true, isTask: false, data: parsed };
-              }
-            } catch {
-              /* not JSON */
             }
-
-            // CAPTCHA check inside browser evaluate.
-            if (body && body.includes("FAIL_SYS_USER_VALIDATE")) {
-              return { success: false, isCaptcha: true, errorBody: body };
-            }
-
             return {
-              success: false,
-              error: "Unexpected non-SSE 200 response",
-              errorBody: body,
+              success: true,
+              isTask: false,
+              data: {
+                id: responseId || `chatcmpl-${Date.now()}`,
+                object: "chat.completion",
+                created: Math.floor(Date.now() / 1000),
+                model: data.payload.model,
+                choices: [
+                  {
+                    index: 0,
+                    message: { role: "assistant", content: fullContent },
+                    finish_reason: "stop",
+                  },
+                ],
+                usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+              },
             };
           }
-
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
-          let fullContent = "";
-          let responseId = null;
-          let usage = null;
-          let finished = false;
-          let streamError = null;
-
-          while (!finished) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-
-            for (const line of lines) {
-              if (!line.trim() || !line.startsWith("data: ")) continue;
-              const jsonStr = line.substring(6).trim();
-              if (!jsonStr) continue;
-              try {
-                const chunk = JSON.parse(jsonStr);
-
-                if (chunk.code === "RateLimited" || (chunk.code && chunk.detail)) {
-                  streamError = { status: 429, errorBody: JSON.stringify(chunk) };
-                  finished = true;
-                  break;
-                }
-                if (chunk.error && !chunk.choices) {
-                  streamError = { status: 500, errorBody: JSON.stringify(chunk) };
-                  finished = true;
-                  break;
-                }
-
-                if (chunk["response.created"]) responseId = chunk["response.created"].response_id;
-                if (chunk.choices && chunk.choices[0]) {
-                  const delta = chunk.choices[0].delta;
-                  if (delta && delta.content) fullContent += delta.content;
-                  if (delta && delta.status === "finished") finished = true;
-                }
-                if (chunk.usage) usage = chunk.usage;
-              } catch {
-                /* ignore parse errors for individual chunks */
-              }
-            }
-          }
-
-          if (streamError) {
-            return { success: false, ...streamError };
-          }
-
-          return {
-            success: true,
-            isTask: false,
-            data: {
-              id: responseId || "chatcmpl-" + Date.now(),
-              object: "chat.completion",
-              created: Math.floor(Date.now() / 1000),
-              model: data.payload.model,
-              choices: [
-                {
-                  index: 0,
-                  message: { role: "assistant", content: fullContent },
-                  finish_reason: "stop",
-                },
-              ],
-              usage: usage || {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-              },
-              response_id: responseId,
-            },
-          };
         }
 
         const errorBody = await response.text();
@@ -1169,67 +1088,39 @@ export async function createChatV2(
     if (!getAuthToken()) return { error: "Не удалось получить токен авторизации" };
   }
 
-  let page = null;
+  const authHeader = getAuthToken();
+  if (!authHeader) return { error: "Токен авторизации не найден" };
+
+  // Use Node.js fetch directly — evaluateInBrowser timeouts are unreliable.
+  let result;
   try {
-    page = await pagePool.getPage(browserContext);
-
-    const payload = {
-      title,
-      models: [model],
-      chat_mode: "normal",
-      chat_type: "t2t",
-      timestamp: Date.now(),
-    };
-    const requestBody = {
-      apiUrl: CREATE_CHAT_URL,
-      payload,
-      token: getAuthToken(),
-    };
-
-    const result = await evaluateInBrowser(
-      page,
-      async (data) => {
-        try {
-          const response = await fetch(data.apiUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${data.token}`,
-            },
-            body: JSON.stringify(data.payload),
-          });
-          if (response.ok) return { success: true, data: await response.json() };
-          return {
-            success: false,
-            status: response.status,
-            errorBody: await response.text(),
-          };
-        } catch (error) {
-          return { success: false, error: error.toString() };
-        }
+    const response = await fetch(CREATE_CHAT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${authHeader}`,
       },
-      [requestBody]
-    );
+      body: JSON.stringify({
+        title,
+        models: [model],
+        chat_mode: "normal",
+        chat_type: "t2t",
+        timestamp: Date.now(),
+      }),
+    });
 
-    pagePool.releasePage(page);
-    page = null;
-
-    if (result.success && result.data.success) {
-      const createdChatId = result.data.data.id;
-      logInfo(`Чат создан: ${createdChatId}`);
-
-      // Bind this chat to the account that created it — prevents cross-account "not exist" errors
-      if (resolvedTokenObj?.id) {
-        setChatTokenOwner(createdChatId, resolvedTokenObj.id);
-      }
-
-      return {
-        success: true,
-        chatId: createdChatId,
-        requestId: result.data.request_id,
-      };
+    if (response.ok) {
+      const json = await response.json();
+      result = { success: true, data: json };
+    } else {
+      const errorBody = await response.text();
+      result = { success: false, status: response.status, errorBody };
     }
+  } catch (error) {
+    return { error: `Сетевая ошибка при создании чата: ${error.message}` };
+  }
 
+  if (!result.success || !result.data?.success) {
     const isTransient = result.status >= 500 && result.status < 600;
     if (isTransient && retryCount < MAX_RETRY_COUNT) {
       logWarn(
@@ -1241,77 +1132,53 @@ export async function createChatV2(
 
     const cleanError = isTransient
       ? `Qwen API недоступен (${result.status}). Повторите позже.`
-      : result.errorBody || result.error || "Неизвестная ошибка";
+      : result.errorBody || "Неизвестная ошибка";
     logError(`Ошибка при создании чата: ${result.status || "unknown"} (попытка ${retryCount + 1})`);
     return { error: cleanError };
-  } catch (error) {
-    logError("Ошибка при создании чата", error);
-    return { error: error.toString() };
-  } finally {
-    if (page) {
-      pagePool.releasePage(page);
-    }
   }
+
+  const createdChatId = result.data.data.id;
+  logInfo(`Чат создан: ${createdChatId}`);
+
+  // Bind this chat to the account that created it — prevents cross-account "not exist" errors
+  if (resolvedTokenObj?.id) {
+    setChatTokenOwner(createdChatId, resolvedTokenObj.id);
+  }
+
+  return {
+    success: true,
+    chatId: createdChatId,
+    requestId: result.data.request_id,
+  };
 }
 
 // ─── testToken ───────────────────────────────────────────────────────────────
 
+// Test token using Node.js fetch — no browser needed.
 export async function testToken(token) {
-  const browserContext = getBrowserContext();
-  if (!browserContext) return "ERROR";
+  if (!token) return "ERROR";
 
-  let page;
-  let shouldClosePage = false;
   try {
-    page = await createPage(browserContext);
-    shouldClosePage = page !== browserContext;
-    await page.goto(CHAT_PAGE_URL, { waitUntil: "domcontentloaded" });
-
-    const requestBody = {
-      apiUrl: CHAT_API_URL,
-      token,
-      payload: {
+    const response = await fetch(CHAT_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
         chat_type: "t2t",
         messages: [{ role: "user", content: "ping", chat_type: "t2t" }],
         model: DEFAULT_MODEL,
         stream: false,
-      },
-    };
+      }),
+    });
 
-    const result = await evaluateInBrowser(
-      page,
-      async (data) => {
-        try {
-          const res = await fetch(data.apiUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${data.token}`,
-            },
-            body: JSON.stringify(data.payload),
-          });
-          return { ok: res.ok, status: res.status };
-        } catch (e) {
-          return { ok: false, status: 0, error: e.toString() };
-        }
-      },
-      [requestBody]
-    );
-
-    if (result.ok || result.status === 400) return "OK";
-    if (result.status === 401 || result.status === 403) return "UNAUTHORIZED";
-    if (result.status === 429) return "RATELIMIT";
+    if (response.ok || response.status === 400) return "OK";
+    if (response.status === 401 || response.status === 403) return "UNAUTHORIZED";
+    if (response.status === 429) return "RATELIMIT";
     return "ERROR";
   } catch (e) {
     logError("testToken error", e);
     return "ERROR";
-  } finally {
-    if (page) {
-      try {
-        if (shouldClosePage) await page.close();
-      } catch {
-        // Page close failure is non-critical during shutdown
-      }
-    }
   }
 }
