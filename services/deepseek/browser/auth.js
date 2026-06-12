@@ -629,15 +629,17 @@ export async function addAccountInteractive() {
     console.log("1. Нажмите Login в правом верхнем углу.");
     console.log("2. Войдите через GitHub / Google в браузере.");
     console.log("3. Отправьте короткое сообщение (напр. 'ok') — это обязательно!");
-    console.log("4. После отправки сообщения нажмите ENTER здесь.");
+    console.log("   Сообщение заставляет DeepSeek загрузить PoW модуль и сохранить сессию.");
+    console.log("4. ПОДОЖДИТЕ 5 секунд после отправки, затем нажмите ENTER здесь.");
     console.log("------------------------------------------------------\n");
 
     const { prompt } = await import("../../../shared/utils/prompt.js");
     await prompt("Нажмите ENTER после успешной авторизации...");
     logInfo("Вход подтверждён, извлекаю сессию...");
 
-    // Wait for page to settle after sending message
-    await new Promise((r) => setTimeout(r, 5000));
+    // Wait for DeepSeek to finish loading WASM + PoW modules (they load AFTER first API call)
+    logInfo("[Auth] Ожидание загрузки WASM модулей (8s)...");
+    await new Promise((r) => setTimeout(r, 8000));
 
     // === Collect PoW data from ALL sources and merge ===
 
@@ -700,9 +702,9 @@ export async function addAccountInteractive() {
       `[Auth] CDP capture: wasm=${!!cdpPoW.wasmUrl}, hif_dliq=${!!cdpPoW.hif_dliq}, hif_leim=${!!cdpPoW.hif_leim}, events=${networkEvents.length}`
     );
 
-    // Source 3: Find WASM URL from page resources (performance API + script tags)
+    // Source 3: Find WASM URL from page resources (performance API + config search)
     const resourceWasm = await page.evaluate(() => {
-      // Check all loaded resources via performance.getEntriesByType
+      // Method 1: performance.getEntriesByType for .wasm
       try {
         const entries = performance.getEntriesByType("resource");
         for (const entry of entries) {
@@ -710,11 +712,54 @@ export async function addAccountInteractive() {
         }
       } catch {}
 
-      // Check script tags for wasm references
+      // Method 1b: Extended search — solve, pow, challenge patterns
+      try {
+        const entries = performance.getEntriesByType("resource");
+        for (const entry of entries) {
+          if (/solve|pow|challenge/i.test(entry.name)) return entry.name;
+        }
+      } catch {}
+
+      // Method 2: Script tags with wasm/pow references
       try {
         for (const script of document.querySelectorAll("script[src]")) {
-          if (/wasm.*solve|pow.*wasm/.test(script.src)) return script.src;
+          if (/wasm.*solve|pow.*wasm/i.test(script.src.toLowerCase())) return script.src;
         }
+      } catch {}
+
+      // Method 3: Global window variables
+      try {
+        if (window.__DS_WASM_URL__) return window.__DS_WASM_URL__;
+        if (window.deepseekWasmUrl) return window.deepseekWasmUrl;
+      } catch {}
+
+      // Method 4: Search server config in localStorage for wasm CDN path
+      try {
+        const serverConfig = localStorage.getItem("APMPLUS__cache__server__config__675113");
+        if (serverConfig) {
+          const parsed = JSON.parse(serverConfig);
+          const str = JSON.stringify(parsed);
+          const match = str.match(/https?:\/\/[^"]*wasm[^"]*/i);
+          if (match) return match[0];
+        }
+      } catch {}
+
+      // Method 5: Remote feature store may have wasm URL hints
+      try {
+        const featureStore = localStorage.getItem("__ds_remote_feature_store");
+        if (featureStore) {
+          const parsed = JSON.parse(featureStore);
+          const str = JSON.stringify(parsed);
+          const match = str.match(/https?:\/\/[^"]*wasm[^"]*/i);
+          if (match) return match[0];
+        }
+      } catch {}
+
+      // Method 6: Dump candidates as last resort
+      try {
+        const entries = performance.getEntriesByType("resource");
+        const candidates = entries.filter((e) => /wasm|pow|solve|challenge/i.test(e.name));
+        if (candidates.length > 0 && candidates.length < 20) return candidates[0].name;
       } catch {}
 
       return null;
@@ -730,6 +775,22 @@ export async function addAccountInteractive() {
     logInfo(
       `[Auth] Merged PoW: wasm=${!!mergedPoW.wasmUrl}, hif_dliq=${!!mergedPoW.hif_dliq}, hif_leim=${!!mergedPoW.hif_leim}`
     );
+
+    // Debug: if WASM still not found, dump ALL performance resources to help diagnose
+    if (!mergedPoW.wasmUrl) {
+      const allResources = await page.evaluate(() => {
+        try {
+          return performance.getEntriesByType("resource").map((e) => e.name);
+        } catch (e) {
+          return [];
+        }
+      });
+      logWarn(`[Auth] WASM не найден! Всего ресурсов: ${allResources.length}`);
+      // Show only resources that might be related to WASM/PoW
+      const interesting = allResources.filter((r) => /wasm|pow|solve|challenge|worker|js/i.test(r));
+      if (interesting.length > 0 && interesting.length < 50)
+        logWarn(`[Auth] Подозрительные ресурсы: ${interesting.join(" | ")}`);
+    }
 
     const extracted = await extractSessionToAccount(page, mergedPoW);
 

@@ -61,3 +61,35 @@ Qwen WAF блокирует все Node-fetch запросы, а browser XHR fal
 - Добавлен `permissions.query` override (anti-headless detection)
 
 ## DeepSeek PoW & WASM (Sessions 63–)
+
+### Cookie истекли + WASM не найден (2026-06-12)
+
+**Проблема:** После загрузки cookie из сессии proxyPage.js выводил "Cookie истекли", хотя cookie были валидны. WASM URL для PoW всегда пустой — `hif_dliq`/`hif_leim` не сохранялись при авторизации.
+
+**Причины:**
+1. `checkAuthViaApi()` проверял cookie только на одном домене (`chat.deepseek.com`), а `aws-waf-token` установлен на `.deepseek.com`
+2. После `page.goto()` WAF DeepSeek обновляет cookie, но проверка срабатывала до полного обновления
+3. WASM загружается асинхронно после отправки первого сообщения — `performance.getEntriesByType()` не видел его если вызывался слишком рано
+4. CDP network capture не использовался при запуске прокси (только при авторизации)
+
+**Изменения:**
+
+**`services/deepseek/browser/proxyPage.js`:**
+- `checkAuthViaApi()`: проверка cookie на ДВУХ доменах (`chat.deepseek.com` + `.deepseek.com`) объединённая в один массив
+- `checkAuthViaApi()`: добавлен fallback на userToken из localStorage если cookie не найдены
+- Добавлена функция `enableProxyNetworkCapture()` — CDP перехват ресурсов при запуске прокси (захват WASM URL)
+- `initBrowserPage()`: вызов CDP capture перед навигацией, увеличен таймаут загрузки с 3s → 5s
+- Новая переменная `proxyWasmUrl` для хранения CDP-captured URL
+- `findWasmUrl()`: расширена с 5 до 8 методов поиска:
+  - Priority 0: использовать proxyWasmUrl (CDP-captured, самый надёжный)
+  - Method 1b: паттерны solve/pow/challenge в ресурсах
+  - Method 6: поиск WASM URL в APMPlus server config (localStorage)
+  - Method 7: поиск в remote feature store
+  - Last resort: фильтрация всех ресурсов по ключевым словам
+- Увеличен wait после `networkidle2`: 3s → 5s (время на WAF refresh + async WASM load)
+
+**`services/deepseek/browser/auth.js`:**
+- `addAccountInteractive()`: увеличено ожидание после сообщения: 5s → 8s (WASM грузится ПОСЛЕ API call)
+- Resource search расширен с 2 до 7 методов (те же что в proxyPage.js, без async caches)
+- Добавлен debug dump: если WASM не найден — вывести все "подозрительные" ресурсы
+- Обновлена инструкция для пользователя: указать подождать 5s после отправки сообщения

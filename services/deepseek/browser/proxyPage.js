@@ -37,6 +37,7 @@ let page = null;
 let cdpSession = null; // CDP session for network interception
 let activeInterceptId = null; // Pending request ID to intercept
 let interceptedRequest = null; // Captured { requestId, url, headers }
+let proxyWasmUrl = null; // WASM URL captured from page resources via CDP
 
 // Cached session data loaded once at init
 let cachedAuthData = {};
@@ -90,19 +91,47 @@ async function restoreLocalStorage(page, storage) {
 /** Check if user is authenticated — verify cookies exist on the target domain */
 async function checkAuthViaApi(page) {
   try {
-    // DeepSeek's /api/v0/user requires PoW headers (hif-dliq/hif-leim)
-    // which we don't have → returns MISSING_HEADER even with valid cookies.
-    // Instead, just verify the essential cookie exists on page cookies().
-    const cookies = await page.cookies(CHAT_PAGE_URL);
-    if (!cookies.length) return false;
+    // Check cookies on BOTH domains — DeepSeek sets aws-waf-token on .deepseek.com,
+    // ds_session_id on chat.deepseek.com. After WAF refresh, new token may replace old.
+    const cookiesChat = await page.cookies("https://chat.deepseek.com");
+    const cookiesRoot = await page.cookies("https://.deepseek.com");
+    const allCookies = [...cookiesChat, ...cookiesRoot];
+
+    if (!allCookies.length) {
+      logDebug(`[BrowserProxy] Нет cookie на странице`);
+      return false;
+    }
 
     // Check for essential auth cookies (set by DeepSeek SSO)
-    const hasAuthCookie = cookies.some(
+    const hasAuthCookie = allCookies.some(
       (c) => c.name === "aws-waf-token" || c.name === "ds_session_id"
     );
-    return hasAuthCookie;
-  } catch {
-    logDebug("[BrowserProxy] Cookie проверка недоступна, fallback на localStorage");
+
+    if (!hasAuthCookie) {
+      // Debug: show what cookies we actually have
+      const cookieNames = allCookies.map((c) => c.name);
+      logDebug(
+        `[BrowserProxy] Cookie на странице (${allCookies.length}): ${cookieNames.join(", ")}`
+      );
+    }
+
+    if (hasAuthCookie) return true;
+
+    // Fallback: check for userToken in restored localStorage
+    try {
+      const ls = await page.evaluate(() => {
+        const token = localStorage.getItem("userToken");
+        return token ? JSON.parse(token)?.value || "" : "";
+      });
+      if (ls) {
+        logInfo(`[BrowserProxy] Fallback: userToken найден в localStorage`);
+        return true;
+      }
+    } catch {}
+
+    return false;
+  } catch (e) {
+    logDebug(`[BrowserProxy] Cookie проверка недоступна: ${e.message}`);
     // Fallback: check if we have userToken in restored localStorage
     try {
       const ls = await page.evaluate(() => !!localStorage.getItem("userToken"));
@@ -110,6 +139,39 @@ async function checkAuthViaApi(page) {
     } catch {
       return false;
     }
+  }
+}
+
+/** Enable CDP network capture during proxy initialization.
+ * Lightweight — captures WASM resources and PoW headers from page load.
+ */
+async function enableProxyNetworkCapture(page) {
+  try {
+    cdpSession = await page.createCDPSession();
+    await cdpSession.send("Network.enable", { maxPostDataSize: 65536 });
+    proxyWasmUrl = null;
+
+    // Track resource loading — find WASM files
+    cdpSession.on("Network.requestWillBeSent", (params) => {
+      const url = params.request?.url || "";
+      if (!proxyWasmUrl && /\.wasm/i.test(url)) {
+        proxyWasmUrl = url;
+        logInfo(`[BrowserProxy] CDP: WASM resource найден — ${url.slice(0, 120)}`);
+      }
+    });
+
+    // Capture response headers (may contain WAF challenge info)
+    cdpSession.on("Network.responseReceived", (params) => {
+      const url = params.response?.url || "";
+      if (/\.wasm/i.test(url) && !proxyWasmUrl) {
+        proxyWasmUrl = url;
+        logInfo(`[BrowserProxy] CDP response: WASM resource найден — ${url.slice(0, 120)}`);
+      }
+    });
+
+    logDebug("[BrowserProxy] CDP network observer enabled (lightweight)");
+  } catch (e) {
+    logWarn(`[BrowserProxy] Network capture failed: ${e.message}`);
   }
 }
 
@@ -161,14 +223,22 @@ export async function initBrowserPage() {
       logInfo(`[BrowserProxy] Загружено ${savedSession.cookies.length} cookie из сессии`);
     }
 
-    // Step 4: Navigate to DeepSeek
+    // Step 4: Enable CDP network capture to intercept WASM + PoW headers during page load
+    await enableProxyNetworkCapture(page);
+
+    // Navigate to DeepSeek
     await page.goto(CHAT_PAGE_URL, { waitUntil: "networkidle2", timeout: 30_000 });
 
     // Wait for ALL resources to load (including .wasm which DeepSeek fetches dynamically)
     logInfo("[BrowserProxy] Ожидание полной загрузки ресурсов страницы...");
     await page.evaluate(async () => {
-      return new Promise((resolve) => setTimeout(resolve, 3000));
+      return new Promise((resolve) => setTimeout(resolve, 5000));
     });
+
+    // Log captured PoW data from network interception
+    if (proxyWasmUrl) {
+      logInfo(`[BrowserProxy] WASM URL найден через CDP: ${proxyWasmUrl.slice(0, 80)}...`);
+    }
 
     // Step 5: Reliable auth check via API instead of document.cookie sniffing
     const loggedIn = await checkAuthViaApi(page);
@@ -254,6 +324,9 @@ async function ensureSession(conversationHint) {
 
 /** Find WASM URL in the page context using multiple strategies */
 async function findWasmUrl() {
+  // Priority 0: Use CDP-captured URL (most reliable — captures ALL resource requests)
+  if (proxyWasmUrl) return proxyWasmUrl;
+
   if (!page) return null;
 
   const wasmUrlResult = await page.evaluate(async () => {
@@ -262,6 +335,14 @@ async function findWasmUrl() {
       const entries = performance.getEntriesByType("resource");
       for (const entry of entries) {
         if (/\.wasm/i.test(entry.name)) return entry.name;
+      }
+    } catch {}
+
+    try {
+      // Method 1b: Extended — search all resources, including blob URLs and JS with wasm references
+      const entries = performance.getEntriesByType("resource");
+      for (const entry of entries) {
+        if (/solve|pow|challenge/i.test(entry.name)) return entry.name;
       }
     } catch {}
 
@@ -282,9 +363,10 @@ async function findWasmUrl() {
 
     try {
       // Method 4: Check loaded modules from service worker or caches
+      const winCaches = window.caches;
       for (const cacheName of ["ds-cache", "pow-cache", "app-cache"]) {
-        if (caches) {
-          const cache = await caches.open(cacheName);
+        if (winCaches) {
+          const cache = await winCaches.open(cacheName);
           const keys = await cache.keys();
           for (const req of keys) {
             if (/\.wasm/i.test(req.url)) return req.url;
@@ -297,11 +379,44 @@ async function findWasmUrl() {
       // Method 5: DeepSeek may store wasm URL in localStorage or sessionStorage after loading
       const lsKeys = Object.keys(localStorage);
       for (const key of lsKeys) {
-        if (/wasm/.test(key)) return localStorage.getItem(key);
+        if (/wasm/i.test(key)) return localStorage.getItem(key);
       }
       const ssKeys = Object.keys(sessionStorage);
       for (const key of ssKeys) {
-        if (/wasm/.test(key)) return sessionStorage.getItem(key);
+        if (/wasm/i.test(key)) return sessionStorage.getItem(key);
+      }
+    } catch {}
+
+    // Method 6: Search in server config stored by APMPlus — may contain wasm CDN path
+    try {
+      const serverConfig = localStorage.getItem("APMPLUS__cache__server__config__675113");
+      if (serverConfig) {
+        const parsed = JSON.parse(serverConfig);
+        const str = JSON.stringify(parsed);
+        // Look for wasm URLs in the config string
+        const match = str.match(/https?:\/\/[^"]*wasm[^"]*/i);
+        if (match) return match[0];
+      }
+    } catch {}
+
+    try {
+      // Method 7: Remote feature store may have wasm URL hints
+      const featureStore = localStorage.getItem("__ds_remote_feature_store");
+      if (featureStore) {
+        const parsed = JSON.parse(featureStore);
+        const str = JSON.stringify(parsed);
+        const match = str.match(/https?:\/\/[^"]*wasm[^"]*/i);
+        if (match) return match[0];
+      }
+    } catch {}
+
+    // Debug: dump all resource names to help identify WASM location
+    try {
+      const entries = performance.getEntriesByType("resource");
+      const wasmCandidates = entries.filter((e) => /wasm|pow|solve|challenge/i.test(e.name));
+      if (wasmCandidates.length > 0 && wasmCandidates.length < 20) {
+        // Return first non-filtered match as last resort
+        return wasmCandidates[0]?.name;
       }
     } catch {}
 
