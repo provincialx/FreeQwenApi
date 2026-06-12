@@ -34,6 +34,9 @@ function resolveActiveFile() {
 
 let browser = null;
 let page = null;
+let cdpSession = null; // CDP session for network interception
+let activeInterceptId = null; // Pending request ID to intercept
+let interceptedRequest = null; // Captured { requestId, url, headers }
 
 // Cached session data loaded once at init
 let cachedAuthData = {};
@@ -45,7 +48,6 @@ function loadSavedSession() {
     const { file } = resolveActiveFile();
     if (!fs.existsSync(file)) return null;
 
-    console.log(`[BrowserProxy] Чтение сессии из: ${file}`);
     const data = JSON.parse(fs.readFileSync(file, "utf8"));
 
     if (Array.isArray(data) && data.length > 0) {
@@ -76,7 +78,6 @@ async function restoreLocalStorage(page, storage) {
   await page.evaluateOnNewDocument((entries) => {
     for (const [key, val] of entries) {
       try {
-        // Restore JSON values as strings
         const strVal = typeof val === "string" ? val : JSON.stringify(val);
         if (!localStorage.getItem(key)) localStorage.setItem(key, strVal);
       } catch {}
@@ -86,24 +87,29 @@ async function restoreLocalStorage(page, storage) {
   logInfo(`[BrowserProxy] Предварительно загружено ${lsEntries.length} записей localStorage`);
 }
 
-/** Check if user is authenticated via API call (reliable, doesn't depend on cookie flags) */
+/** Check if user is authenticated — verify cookies exist on the target domain */
 async function checkAuthViaApi(page) {
   try {
-    const result = await page.evaluate(async () => {
-      // Simple HEAD to /api/v0/user — returns 200 if auth works
-      const resp = await fetch("https://chat.deepseek.com/api/v0/user", {
-        credentials: "include",
-        headers: { Accept: "*/*" },
-      });
-      return { status: resp.status, ok: resp.ok };
-    });
-
-    return result.ok;
-  } catch {
-    // Fallback: check if we have cookies at all via page.cookies() is not available in evaluate
-    logDebug("[BrowserProxy] API проверка недоступна, fallback на cookie проверку");
+    // DeepSeek's /api/v0/user requires PoW headers (hif-dliq/hif-leim)
+    // which we don't have → returns MISSING_HEADER even with valid cookies.
+    // Instead, just verify the essential cookie exists on page cookies().
     const cookies = await page.cookies(CHAT_PAGE_URL);
-    return cookies.some((c) => c.name === "aws-waf-token" || c.name.includes("session"));
+    if (!cookies.length) return false;
+
+    // Check for essential auth cookies (set by DeepSeek SSO)
+    const hasAuthCookie = cookies.some(
+      (c) => c.name === "aws-waf-token" || c.name === "ds_session_id"
+    );
+    return hasAuthCookie;
+  } catch {
+    logDebug("[BrowserProxy] Cookie проверка недоступна, fallback на localStorage");
+    // Fallback: check if we have userToken in restored localStorage
+    try {
+      const ls = await page.evaluate(() => !!localStorage.getItem("userToken"));
+      return !!ls;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -140,19 +146,19 @@ export async function initBrowserPage() {
       cachedStorage = { ls: {}, ss: {} };
     }
 
-    // Step 2: Create page with interceptors already registered (before any navigation)
+    // Step 2: Create page with localStorage restoration FIRST (before any navigation)
     page = await browser.newPage();
     await page.setViewport({ width: 1920, height: 1080 });
+
+    // CRITICAL: Restore localStorage BEFORE cookies — some DeepSeek features depend on it
+    if (cachedStorage.ls && Object.keys(cachedStorage.ls).length > 0) {
+      await restoreLocalStorage(page, cachedStorage);
+    }
 
     // Restore cookies BEFORE navigation (browser sends them with the request)
     if (savedSession && savedSession.cookies.length > 0) {
       await page.setCookie(...savedSession.cookies);
       logInfo(`[BrowserProxy] Загружено ${savedSession.cookies.length} cookie из сессии`);
-    }
-
-    // Step 3: Restore localStorage BEFORE navigation via evaluateOnNewDocument
-    if (cachedStorage.ls && Object.keys(cachedStorage.ls).length > 0) {
-      await restoreLocalStorage(page, cachedStorage);
     }
 
     // Step 4: Navigate to DeepSeek
@@ -161,16 +167,14 @@ export async function initBrowserPage() {
     // Wait for ALL resources to load (including .wasm which DeepSeek fetches dynamically)
     logInfo("[BrowserProxy] Ожидание полной загрузки ресурсов страницы...");
     await page.evaluate(async () => {
-      return new Promise((resolve) => setTimeout(resolve, 3000)); // 3s grace period for WASM preload
+      return new Promise((resolve) => setTimeout(resolve, 3000));
     });
 
     // Step 5: Reliable auth check via API instead of document.cookie sniffing
     const loggedIn = await checkAuthViaApi(page);
 
     if (!loggedIn) {
-      logWarn(
-        "[BrowserProxy] 🔴 Сессия не авторизована. Запустите меню → пункт 1 (Войти в DeepSeek)"
-      );
+      logWarn("[BrowserProxy] 🔴 Cookie истекли! Запустите авторизацию заново (меню → пункт 1)");
     } else {
       logInfo("✅ Браузерная страница готова (авторизован)");
     }
@@ -227,7 +231,6 @@ async function ensureSession(conversationHint) {
 
     if (result.error && result.error.includes("INVALID_TOKEN")) {
       logWarn(`[BrowserProxy] 🔴 Cookie истекли! Запустите авторизацию заново (меню → пункт 1)`);
-      // Clear cached session so we retry next time
       chatSessions.clear();
     } else if (result.error) {
       logWarn(`[BrowserProxy] createSession failed: ${result.error}`);
@@ -247,6 +250,65 @@ async function ensureSession(conversationHint) {
   const fallback = { sessionId: crypto.randomUUID(), parentMessageId: null };
   chatSessions.set(hint, fallback);
   return fallback;
+}
+
+/** Find WASM URL in the page context using multiple strategies */
+async function findWasmUrl() {
+  if (!page) return null;
+
+  const wasmUrlResult = await page.evaluate(async () => {
+    try {
+      // Method 1: Check performance API for .wasm resources
+      const entries = performance.getEntriesByType("resource");
+      for (const entry of entries) {
+        if (/\.wasm/i.test(entry.name)) return entry.name;
+      }
+    } catch {}
+
+    try {
+      // Method 2: Check all scripts for wasm-related names
+      for (const script of document.querySelectorAll("script[src]")) {
+        const src = script.src.toLowerCase();
+        if (/wasm/.test(src) || /solve/i.test(src)) return script.src;
+      }
+    } catch {}
+
+    try {
+      // Method 3: Look for wasm URLs in global variables set by the app
+      const win = window;
+      if (win.__DS_WASM_URL__) return win.__DS_WASM_URL__;
+      if (win.deepseekWasmUrl) return win.deepseekWasmUrl;
+    } catch {}
+
+    try {
+      // Method 4: Check loaded modules from service worker or caches
+      for (const cacheName of ["ds-cache", "pow-cache", "app-cache"]) {
+        if (caches) {
+          const cache = await caches.open(cacheName);
+          const keys = await cache.keys();
+          for (const req of keys) {
+            if (/\.wasm/i.test(req.url)) return req.url;
+          }
+        }
+      }
+    } catch {}
+
+    try {
+      // Method 5: DeepSeek may store wasm URL in localStorage or sessionStorage after loading
+      const lsKeys = Object.keys(localStorage);
+      for (const key of lsKeys) {
+        if (/wasm/.test(key)) return localStorage.getItem(key);
+      }
+      const ssKeys = Object.keys(sessionStorage);
+      for (const key of ssKeys) {
+        if (/wasm/.test(key)) return sessionStorage.getItem(key);
+      }
+    } catch {}
+
+    return null;
+  });
+
+  return wasmUrlResult;
 }
 
 export async function sendViaBrowser(messages, model, conversationHint) {
@@ -289,67 +351,7 @@ export async function sendViaBrowser(messages, model, conversationHint) {
 
     // Find WASM URL inside the browser context (DeepSeek loads it dynamically on every visit)
     logInfo("[BrowserProxy] Поиск WASM модуля для PoW...");
-    const wasmUrlResult = await page.evaluate(async () => {
-      try {
-        // Method 1: Check performance API for .wasm resources
-        const entries = performance.getEntriesByType("resource");
-        for (const entry of entries) {
-          if (/\.wasm/i.test(entry.name)) return entry.name;
-        }
-      } catch {}
-
-      try {
-        // Method 2: Check all scripts for wasm-related names
-        for (const script of document.querySelectorAll("script[src]")) {
-          const src = script.src.toLowerCase();
-          if (/wasm/.test(src) || /solve/i.test(src)) return script.src;
-        }
-      } catch {}
-
-      try {
-        // Method 3: Look for wasm URLs in global variables set by the app
-        // DeepSeek often stores loaded modules in window objects
-        const win = window;
-        if (win.__DS_WASM_URL__) return win.__DS_WASM_URL__;
-        if (win.deepseekWasmUrl) return win.deepseekWasmUrl;
-      } catch {}
-
-      try {
-        // Method 4: Check loaded modules from service worker or caches
-        for (const cacheName of ["ds-cache", "pow-cache", "app-cache"]) {
-          if (caches) {
-            const cache = await caches.open(cacheName);
-            const keys = await cache.keys();
-            for (const req of keys) {
-              if (/\.wasm/i.test(req.url)) return req.url;
-            }
-          }
-        }
-      } catch {}
-
-      try {
-        // Method 5: DeepSeek may store wasm URL in localStorage or sessionStorage after loading
-        const lsKeys = Object.keys(localStorage);
-        for (const key of lsKeys) {
-          if (/wasm/.test(key)) return localStorage.getItem(key);
-        }
-        const ssKeys = Object.keys(sessionStorage);
-        for (const key of ssKeys) {
-          if (/wasm/.test(key)) return sessionStorage.getItem(key);
-        }
-      } catch {}
-
-      // Method 6: Dump first 20 resources to debug what's loaded
-      try {
-        const entries = performance.getEntriesByType("resource");
-        console.log(
-          "[DEBUG] Loaded resources:",
-          entries.slice(0, 20).map((e) => e.name)
-        );
-      } catch {}
-
-      return null;
-    });
+    let wasmUrlResult = await findWasmUrl();
 
     let powResponseHeader = "";
     if (wasmUrlResult) {
@@ -427,7 +429,7 @@ export async function sendViaBrowser(messages, model, conversationHint) {
       logWarn("[BrowserProxy] ⚠️ WASM модуль не найден — PoW пропущен");
     }
 
-    // Pass PoW header into the evaluation context so it can be added to request
+    // Pass PoW header + auth headers into the evaluation context
     return await page.evaluate(
       async ({ prompt, cfg, session, authData, powHeader }) => {
         const apiUrl = "https://chat.deepseek.com/api/v0/chat/completion";
@@ -466,7 +468,8 @@ export async function sendViaBrowser(messages, model, conversationHint) {
           chat_session_id: chatSessionId,
         };
 
-        // Build headers — PoW interceptor adds hif-dliq/hif-leim automatically via fetch override
+        // Build headers — include all anti-fingerprint headers from authData
+        const authHeaders = (authData && typeof authData === "object") || {};
         const headers = {
           Accept: "*/*",
           "Content-Type": "application/json;charset=UTF-8",
@@ -478,6 +481,19 @@ export async function sendViaBrowser(messages, model, conversationHint) {
           "Sec-Ch-Ua-Platform": '"Windows"',
           "x-client-platform": "web",
         };
+
+        // CRITICAL: Add hif-dliq and hif-leim from authData (anti-fingerprint headers)
+        if (authHeaders.hif_dliq) {
+          headers["hif-dliq"] = authHeaders.hif_dliq;
+        }
+        if (authHeaders.hif_leim) {
+          headers["hif-leim"] = authHeaders.hif_leim;
+        }
+
+        // Add x-client-version if available
+        if (authHeaders.x_client_version) {
+          headers["x-client-version"] = authHeaders.x_client_version;
+        }
 
         // Add Bearer token if available (for Authorization header)
         if (bearerToken && !String(headers["Authorization"] || "").startsWith("Bearer")) {
@@ -542,7 +558,7 @@ export async function sendViaBrowser(messages, model, conversationHint) {
               contentType: "json",
               keys: debugKeys,
               rawLength: text.length,
-              sample: text.slice(0, 200),
+              sample: text.slice(0, 300),
             },
           };
         }
