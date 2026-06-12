@@ -44,6 +44,10 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // CAPTCHA simulation: fires once per process to test resolver without waiting for Qwen.
 let _captchaSimulated = false;
 
+// WAF skip-Node-fetch flag: after first WAF detection, skip Path 1 for subsequent retries.
+// WAF blocks by IP — retrying Node-fetch is futile even after CAPTCHA resolution.
+let _wafActive = false;
+
 // ─── CLI prompt helper (same pattern as auth.js) ──────────────────────────────
 async function promptUser(message) {
   return new Promise((resolve) => {
@@ -74,6 +78,26 @@ function isCaptchaChallenge(errorBody) {
 
   // Response is HTML with WAF-like inline styles designed to block bots
   if (body.toLowerCase().includes("background:#fff") && body.includes("aliyun")) return true;
+
+  // New WAF patterns — Qwen WAF evolves regularly
+  if (body.includes("/aliyun-waf")) return true;
+  if (body.includes("waf.cloud")) return true;
+  if (body.includes("waf.aliyun")) return true;
+  if (body.includes("__aliyun_waf")) return true;
+  if (/captcha.*(?:verify|challenge)/i.test(body) && body.includes("block")) return true;
+  if (body.includes("window.alidata") || body.includes("alidata.send")) return true;
+  if (body.includes("_awf_sec")) return true;
+  if (body.includes("data:image/svg+xml") && body.length < 5000 && !body.includes("choices"))
+    return true;
+
+  // Generic HTML challenge page — short HTML that isn't an API response
+  if (
+    body.trim().startsWith("<") &&
+    body.includes("html") &&
+    body.length < 10000 &&
+    !body.includes("choices")
+  )
+    return true;
 
   return false;
 }
@@ -194,6 +218,9 @@ async function resolveCaptchaAndRetry(
       logInfo(`Токен обновлён после CAPTCHA`);
     }
 
+    // CAPTCHA пройдена — сбрасываем WAF флаг, следующий запрос попробует Path 1 снова
+    _wafActive = false;
+
     pagePool.releasePage(captchaPage);
 
     // Return to headless mode.
@@ -296,7 +323,6 @@ function buildPayloadV2(
   const newMessage = {
     fid: userMessageId,
     parentId,
-    parent_id: parentId,
     role: "user",
     content: messageContent,
     chat_type: "t2t",
@@ -310,13 +336,14 @@ function buildPayloadV2(
     feature_config: {
       thinking_enabled: false,
       output_schema: "phase",
-      // Disable Qwen Chat built-in tools so external clients (Zed) remain the only tool executor.
+      auto_thinking: false,
+      thinking_mode: "Fast",
+      research_mode: "normal",
       auto_search: false,
       web_search: false,
       search_enabled: false,
       online_search: false,
       internet_search: false,
-      research_mode: "none",
       code_interpreter: false,
       browser_enabled: false,
       plugins_enabled: false,
@@ -325,6 +352,7 @@ function buildPayloadV2(
 
   const payload = {
     stream: true,
+    version: "2.1",
     incremental_output: true,
     chat_id: chatId,
     chat_mode: "normal",
@@ -332,19 +360,6 @@ function buildPayloadV2(
     model,
     parent_id: parentId,
     timestamp: Math.floor(Date.now() / 1000),
-    // Disable Qwen built-in tools at payload level too
-    auto_search: false,
-    web_search: false,
-    search_enabled: false,
-    online_search: false,
-    internet_search: false,
-    search: false,
-    research_mode: "none",
-    code_interpreter: false,
-    browser_enabled: false,
-    plugins_enabled: false,
-    tools_enabled: false,
-    builtin_tools_enabled: false,
   };
 
   if (systemMessage) {
@@ -404,20 +419,12 @@ function parseNonSseCompletionBody(body) {
   };
 }
 
-async function executeApiRequestWithNodeStreaming(
-  apiUrl,
-  payload,
-  token,
-  onChunk = null,
-  cookieStr = ""
-) {
+async function executeApiRequestWithNodeStreaming(apiUrl, payload, onChunk = null, cookieStr = "") {
   try {
-    if (!token) return { success: false, error: "Токен авторизации не найден" };
     if (typeof fetch !== "function") return { success: false, error: "Fetch API is unavailable" };
 
     const headers = {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
       Accept: "*/*",
       Origin: "https://chat.qwen.ai",
       Referer: "https://chat.qwen.ai/",
@@ -425,6 +432,10 @@ async function executeApiRequestWithNodeStreaming(
       "Sec-Fetch-Mode": "cors",
       "Sec-Fetch-Site": "same-origin",
       "User-Agent": USER_AGENT,
+      Version: "0.2.64",
+      source: "web",
+      "X-Request-Id": crypto.randomUUID(),
+      "X-Accel-Buffering": "no",
       ...(cookieStr ? { Cookie: cookieStr } : {}),
     };
 
@@ -591,82 +602,113 @@ async function executeApiRequestWithNodeStreaming(
 
 // Aliyun WAF blocks pure Node.js fetch. Must run INSIDE browser context.
 // protocolTimeout is set to 15+ min in browser.js so long SSE streams don't break the CDP link.
-async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
-  logDebug(`Используем токен: ${token ? "Токен существует" : "Токен отсутствует"}`);
+async function executeApiRequest(page, apiUrl, payload, onChunk = null) {
   logDebug(`API URL: ${apiUrl}`);
 
-  const apiTimeoutMs = Math.max(REQUEST_TIMEOUT_MINUTES * 60_000 + 30_000, 180_000);
-  const requestBody = { apiUrl, payload, token };
+  // Path 2 (browser fetch) — uses page's native fetch wrapped by WAF SDK.
+  // WAF SDK adds bx-ua, bx-umidtoken, bx-v headers automatically.
+  // Auth is via cookies (credentials: "include"), no Bearer token needed.
+  const FETCH_TIMEOUT_MS = Number(process.env.PATH2_FETCH_TIMEOUT) || 60_000;
+  // Overall evaluate timeout — don't let Path 2 hang the main request.
+  const PATH2_EVALUATE_TIMEOUT = Number(process.env.PATH2_EVALUATE_TIMEOUT) || 120_000;
 
+  const requestBody = { apiUrl, payload, fetchTimeout: FETCH_TIMEOUT_MS };
+
+  // Use main-world injection via addScriptTag + DOM event bridge.
+  // page.evaluate() runs in isolated world where fetch is NOT wrapped by WAF SDK.
+  // Scripts injected via addScriptTag() run in the PAGE's main world where fetch is WAF-wrapped.
+  // Communication between worlds via CustomEvent on document (DOM events cross world boundaries).
+  try {
+    // Step 1: Inject fetch runner script into main page world
+    await page.addScriptTag({
+      content: `
+        // Register before __fetch_start event fires
+        document.addEventListener("__fetch_start", async function(e) {
+          var d = e.detail;
+          try {
+            // Use page's native fetch — WAF SDK has already wrapped it to add bx-* headers
+            var response = await fetch(d.url, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Accept": "*/*",
+                "Origin": "https://chat.qwen.ai",
+                "Referer": "https://chat.qwen.ai/",
+                "Version": "0.2.64",
+                "source": "web",
+                "X-Request-Id": crypto.randomUUID(),
+                "X-Accel-Buffering": "no"
+              },
+              body: JSON.stringify(d.payload),
+              credentials: "include"
+            });
+
+            var text = await response.text();
+            document.dispatchEvent(new CustomEvent("__fetch_response", {
+              detail: {
+                ok: response.ok,
+                status: response.status,
+                headers: Array.from(response.headers.entries()),
+                text: text
+              }
+            }));
+          } catch(err) {
+            document.dispatchEvent(new CustomEvent("__fetch_response", {
+              detail: { ok: false, error: err.message }
+            }));
+          }
+        }, { once: true });
+      `,
+    });
+  } catch (e) {
+    return { success: false, error: "Inject fetch script failed: " + e.message };
+  }
+
+  // Step 2: Run evaluate in isolated world — trigger via DOM event, wait for response event
   return evaluateInBrowser(
     page,
     async (data) => {
-      // Define diagnostics vars BEFORE try so catch-block always has them.
-      /* eslint-disable no-undef */
       const startMs = Date.now();
       const browserHostname = typeof location !== "undefined" ? location.hostname : "unknown";
 
       try {
-        if (!data.token) return { success: false, error: "Токен авторизации не найден" };
-
-        const browserOrigin = typeof location !== "undefined" ? location.origin : "unknown";
-
-        // Use relative URL for same-origin XHR — Qwen sends cookies automatically.
-        // If data.apiUrl is absolute (https://chat.qwen.ai/...), extract just path+query.
-        let fetchUrl = data.apiUrl;
-        if (fetchUrl.startsWith("http")) {
-          try {
-            const urlObj = new URL(fetchUrl);
-            fetchUrl = urlObj.pathname + urlObj.search;
-          } catch {}
-        }
-
-        // DIAGNOSTIC: Collect browser state before fetch to understand failures.
-        const diagCookies = document.cookie.substring(0, 200); // truncate for safety
-        const diagStorageToken = localStorage.getItem("token")?.substring(0, 30) + "...";
-
-        // Use XMLHttpRequest — Qwen Studio CSP blocks `fetch()` from evaluate() context.
+        // Trigger fetch in main world via DOM event, then wait for response
         const fullText = await new Promise((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhr.open("POST", fetchUrl);
+          const timeoutId = setTimeout(
+            function () {
+              reject(new Error("Timeout"));
+            },
+            (data.fetchTimeout || 60000) + 5000
+          );
 
-          xhr.setRequestHeader("Content-Type", "application/json");
-          xhr.setRequestHeader("Authorization", `Bearer ${data.token}`);
-          xhr.setRequestHeader("Accept", "*/*");
-          xhr.timeout = 120_000;
+          document.addEventListener(
+            "__fetch_response",
+            function (e) {
+              clearTimeout(timeoutId);
+              resolve(e.detail);
+            },
+            { once: true }
+          );
 
-          xhr.onload = () => {
-            resolve({
-              ok: xhr.status >= 200 && xhr.status < 300,
-              status: xhr.status,
-              headersText: xhr.getAllResponseHeaders(),
-              text: xhr.responseText,
-            });
-          };
-
-          xhr.onerror = () => reject(new Error("XHR network error"));
-
-          // Timeout guard: abort if XHR still pending after 120s.
-          const timeoutGuard = setTimeout(() => {
-            if (xhr.readyState < 4) {
-              xhr.abort();
-              reject(new DOMException("Timeout", "AbortError"));
-            }
-          }, 120_000);
-
-          // Always clear guard on completion.
-          xhr.onloadend = () => clearTimeout(timeoutGuard);
-
-          xhr.send(JSON.stringify(data.payload));
+          // Fire the start event — main world script picks it up
+          document.dispatchEvent(
+            new CustomEvent("__fetch_start", {
+              detail: {
+                url: data.apiUrl,
+                payload: data.payload,
+                timeout: data.fetchTimeout || 60000,
+              },
+            })
+          );
         });
 
-        // XHR response is already fully collected — parse SSE from text.
-        // Extract content-type header value from raw headers string.
+        // Response is already fully collected — parse SSE from text.
+        // Extract content-type header value from headers array.
         let ctValue = "";
         try {
-          for (const h of (fullText.headersText || "").split("\n")) {
-            if (h.toLowerCase().startsWith("content-type:")) {
-              ctValue = h.substring(13).trim();
+          for (const [name, value] of fullText.headers || []) {
+            if (name.toLowerCase() === "content-type") {
+              ctValue = value;
             }
           }
         } catch {}
@@ -731,6 +773,26 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
           };
         }
 
+        // Check if the error response is a WAF/HTML challenge (non-JSON, short HTML)
+        const errorBodyLower = (fullText.text || "").toLowerCase();
+        const isHtmlBlock =
+          errorBodyLower.includes("<html") ||
+          errorBodyLower.includes("<!doctype") ||
+          errorBodyLower.includes("aliyun_waf");
+
+        if (isHtmlBlock) {
+          // NOTE: can't use logWarn here — runs in browser evaluate context
+          return {
+            success: false,
+            isCaptcha: true,
+            isCaptchaReason: "waf_html",
+            status: fullText.status,
+            errorBody: fullText.text,
+            responseBodyPreview: (fullText.text || "").substring(0, 500),
+            debugMeta: respMeta,
+          };
+        }
+
         return {
           success: false,
           status: fullText.status,
@@ -739,11 +801,23 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
         };
       } catch (error) {
         // Catch-all for unexpected errors in browser-evaluate context.
+        // NOTE: can't use logWarn here — runs in browser evaluate context
+        const errMsg = error.message || error.toString();
+        const elapsed = Date.now() - startMs;
+        // Only set isCaptcha on XHR timeout (20s) — that means WAF might be blocking.
+        // XHR network error (0.5-1s) is CSP/sandbox blocking, NOT a CAPTCHA challenge.
+        const isXhrTimeout = errMsg.includes("Timeout") || errMsg.includes("AbortError");
         return {
           success: false,
-          error: `Unexpected evaluate error: ${error.message || error.toString()}`,
+          isCaptcha: isXhrTimeout,
+          isCaptchaReason: isXhrTimeout
+            ? "xhr_timeout"
+            : errMsg.includes("network error")
+              ? "xhr_network_error"
+              : "evaluate_error",
+          error: `XHR evaluate error: ${errMsg}`,
           debugMeta: {
-            elapsedMs: Date.now() - startMs,
+            elapsedMs: elapsed,
             browserHost: browserHostname,
             urlCalled: data.apiUrl.substring(0, 120),
           },
@@ -751,7 +825,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
       }
     },
     [requestBody],
-    apiTimeoutMs
+    PATH2_EVALUATE_TIMEOUT
   );
 }
 
@@ -976,23 +1050,53 @@ export async function sendMessage(
   let response = null;
   let page = null;
 
-  logInfo(`🟢 Node-streaming (path 1): чат ${chatId}, parent: ${parentId || "null"}`);
   const cookieStr = getAuthToken();
   logInfo(`🔍 [S59_CODE_V2] Two-path strategy active`);
   let path1Failed = false;
-  try {
-    response = await executeApiRequestWithNodeStreaming(apiUrl, payload, cookieStr, onChunk);
-    logDebug(`[Path1] Result: success=${response.success}, isCaptcha=${response.isCaptcha}`);
-  } catch (err) {
-    logWarn(`Node-streaming failed: ${err.message}`);
-    path1Failed = true;
+
+  // Skip Path 1 (Node-fetch) if WAF already blocked this IP — retrying is futile.
+  // WAF detects automation from Node.js User-Agent/IP and blocks all subsequent requests.
+  if (_wafActive) {
+    logWarn(`♻️ WAF активен — пропускаю Path 1 (Node-fetch), иду сразу в Path 2`);
+    response = { success: false, isCaptcha: true, error: "WAF skip (active)" };
+  } else {
+    logInfo(`🟢 Node-streaming (path 1): чат ${chatId}, parent: ${parentId || "null"}`);
+    try {
+      response = await executeApiRequestWithNodeStreaming(apiUrl, payload, onChunk, cookieStr);
+      logDebug(`[Path1] Result: success=${response.success}, isCaptcha=${response.isCaptcha}`);
+    } catch (err) {
+      logWarn(`Node-streaming failed: ${err.message}`);
+      path1Failed = true;
+    }
   }
 
   // ── Force browser fallback when Node fetch can't reach Qwen API ───────
   // WAF blocks ALL subsequent Node-fetch from this IP/token. Retrying Node path is futile.
   // Also covers "Токен авторизации" errors — browser can extract token from localStorage.
+  // NEW: "TypeError: terminated" and other network errors also trigger Path 2.
+  const path1NetworkError =
+    response &&
+    !response.success &&
+    response.error &&
+    /terminated|fetch failed|typeerror|networkerror|econnrefused|enotfound|etimedout/i.test(
+      String(response.error)
+    );
+
+  // Log WAF body on first detection for debugging new protection patterns
+  let wafDetected =
+    response && !response.success && (response.isCaptcha || isCaptchaChallenge(response.errorBody));
+
+  if (wafDetected && response.errorBody) {
+    _wafActive = true;
+    logWarn(
+      `[WAF_BODY] Первые 1000 символов ответа WAF:\n${String(response.errorBody).substring(0, 1000)}`
+    );
+  }
+
   const forceBrowserFallback =
+    _wafActive ||
     path1Failed ||
+    path1NetworkError ||
     (response && !response.success && response.isCaptcha) ||
     (response && !response.success && isCaptchaChallenge(response.errorBody));
 
@@ -1007,25 +1111,29 @@ export async function sendMessage(
       logWarn(`🟡 Browser fallback forced: ${reason} → executeApiRequest on main context`);
       try {
         // Use the main authenticated page directly.
-        // Ensure it's navigated and alive before evaluate — XHR fails if document isn't fully loaded!
+        // Navigate to Qwen Chat and wait for WAF SDK to fully load (networkidle0).
+        // WAF SDK loads async from g.alicdn.com/aes/... — domcontentloaded is not enough.
         try {
           await browserContext.goto(CHAT_PAGE_URL, {
-            waitUntil: "domcontentloaded",
+            waitUntil: "networkidle0",
             timeout: PAGE_TIMEOUT,
           });
+          // Extra pause for WAF SDK to finalize initialization after all network activity
+          await delay(2000);
         } catch {
           /* ignore if already navigated */
         }
 
         const path2Start = Date.now();
-        response = await executeApiRequest(
-          browserContext,
-          apiUrl,
-          payload,
-          getAuthToken(),
-          onChunk
-        );
+        logInfo(`[Path2] Запуск fetch fallback к ${apiUrl.substring(0, 80)}...`);
+        response = await executeApiRequest(browserContext, apiUrl, payload, onChunk);
         const path2Elapsed = ((Date.now() - path2Start) / 1000).toFixed(1);
+
+        // Path 2 succeeded — WAF is no longer blocking (browser context bypassed it)
+        if (response.success) {
+          _wafActive = false;
+          logInfo("[Path2] Успех — WAF флаг сброшен");
+        }
 
         logInfo(
           `[Path2] Result: success=${response.success}, error=${
@@ -1064,16 +1172,26 @@ export async function sendMessage(
         // Even browser fetch can be blocked by WAF if the token/IP was flagged.
         if (!response.success && response.errorBody) {
           const bodyStr = String(response.errorBody);
+          logWarn(
+            `[Path2] XHR failed. Status=${response.status}, isCaptcha=${response.isCaptcha}, ` +
+              `bodyPreview: ${bodyStr.substring(0, 500)}`
+          );
           if (isCaptchaChallenge(bodyStr)) {
-            logWarn(
-              "Browser fallback also hit WAF → resolveCaptchaAndRetry needed. Body preview:",
-              bodyStr.substring(0, 200)
-            );
+            logWarn("Browser fallback also hit WAF → resolveCaptchaAndRetry needed.");
           }
+        } else if (!response.success && response.error) {
+          logWarn(`[Path2] XHR error: ${response.error.substring(0, 200)}`);
         }
       } catch (err) {
         logError("Browser fallback on main context failed", err);
-        return { error: `WAF fallback browser request failed: ${err.message}`, chatId };
+        // Don't bail out immediately — let CAPTCHA detection below handle it
+        response = {
+          success: false,
+          isCaptcha: true,
+          isCaptchaReason: "path2_catch",
+          error: `WAF fallback browser request failed: ${err.message}`,
+          chatId,
+        };
       }
     } else if (
       !forceBrowserFallback &&
@@ -1100,8 +1218,11 @@ export async function sendMessage(
       }
       return response.data;
     } else {
-      // Debug: log response keys to understand what path is used
-      logInfo(`[ERR] keys=${Object.keys(response).join(",")} status=${response.status}`);
+      // Debug: log response details to understand what path is used
+      logInfo(
+        `[ERR] keys=${Object.keys(response).join(",")} status=${response.status} ` +
+          `isCaptcha=${response.isCaptcha} error="${(response.error || "").substring(0, 100)}"`
+      );
 
       // ── CAPTCHA detection (FAIL_SYS_USER_VALIDATE) ─────────────────────
       if (
@@ -1289,6 +1410,8 @@ export async function createChatV2(
   if (!authHeader) return { error: "Токен авторизации не найден" };
 
   // Use Node.js fetch directly — evaluateInBrowser timeouts are unreliable.
+  // NOTE: chats/new still uses Bearer token because WAF allows it for this endpoint.
+  // chat/completions endpoint had Bearer removed because WAF blocks it there.
   let result;
   try {
     const response = await fetch(CREATE_CHAT_URL, {
@@ -1296,6 +1419,13 @@ export async function createChatV2(
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${authHeader}`,
+        Accept: "application/json, text/plain, */*",
+        Origin: "https://chat.qwen.ai",
+        Referer: "https://chat.qwen.ai/",
+        "User-Agent": USER_AGENT,
+        Version: "0.2.64",
+        source: "web",
+        "X-Request-Id": crypto.randomUUID(),
       },
       body: JSON.stringify({
         title,
@@ -1303,6 +1433,7 @@ export async function createChatV2(
         chat_mode: "normal",
         chat_type: "t2t",
         timestamp: Date.now(),
+        project_id: "",
       }),
     });
 
@@ -1352,6 +1483,7 @@ export async function createChatV2(
 // ─── testToken ───────────────────────────────────────────────────────────────
 
 // Test token using Node.js fetch — no browser needed.
+// Note: WAF may block this from Node.js; returns "ERROR" on failure.
 export async function testToken(token) {
   if (!token) return "ERROR";
 
@@ -1360,7 +1492,13 @@ export async function testToken(token) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+        Accept: "*/*",
+        Origin: "https://chat.qwen.ai",
+        Referer: "https://chat.qwen.ai/",
+        "User-Agent": USER_AGENT,
+        Version: "0.2.64",
+        source: "web",
+        "X-Request-Id": crypto.randomUUID(),
       },
       body: JSON.stringify({
         chat_type: "t2t",

@@ -1,8 +1,10 @@
-# FreeQwenApi — Status (2026-06-11)
+# FreeQwenApi — Status (2026-06-12)
 
-## Health: GREEN
+## Health: YELLOW — WAF блокирует `chat/completions` даже из браузера
 
-Multi-provider proxy architecture operational. 50+ development sessions across 5 days (June 7–11). No blocking issues.
+Multi-provider proxy architecture operational. HAR-анализ (Session 2026-06-12) выявил ключевые
+отличия от реального Qwen фронтенда: Bearer-токен в заголовках и отсутствие WAF SDK.
+После правок — тестируем новую стратегию: `fetch()` через WAF SDK вместо кастомного XHR.
 
 ### Architecture S61+: Multi-Provider Separation
 
@@ -20,7 +22,7 @@ Project refactored into **process-level isolation**: `index.js` dispatcher forks
 | Unit tests                        | Passing   | 46/46 (`npm test`) — Qwen unit suite unchanged. DeepSeek: no dedicated tests yet (D12).                                                                                                                                                                     |
 | ESLint                            | Clean     | 0 errors, ~37 warnings (known unused imports — tech-debt)                                                                                                                                                                                                   |
 | Prettier                          | Formatted | All files clean                                                                                                                                                                                                                                             |
-| Aliyun WAF bypass (Qwen)          | Working   | All API requests via `evaluateInBrowser` (page.evaluate fetch) — WAF sees legitimate browser context. Two-path strategy (S59): Node.js streaming primary + browser fallback on WAF detection.                                                               |
+| Aliyun WAF bypass (Qwen)          | Reworked  | S59→S62: убран `Authorization: Bearer` (фронтенд Qwen его не шлёт). Path 2 переписан: XHR → `fetch()` в main world (через WAF SDK страницы). Path 1 (Node.js) — только для `chats/new`. `networkidle0` + 2s пауза для WAF SDK.                     |
 | Cookie auth extraction (DeepSeek)     | Working   | Puppeteer one-time visible launch → user login → deepseek_accounts.json saved with Qwen-style format (cookies + authData with token/wasmUrl/hif_dliq/hif_leim). Deep recursive search extracts nested keys from localStorage/sessionStorage JSON objects.                                                                                   |
 | PoW solver (DeepSeek)                | Working   | Proof-of-Work via WASM: fetches challenge from `/create_pow_challenge`, solves with `wasm_solve()`, sends Base64-encoded answer in `X-DS-PoW-Response` header. Critical for DeepSeek Web API — without it returns `INVALID_TOKEN`.                                                                                   |
 | Account binding (Qwen)               | Working   | chatTokenOwner Map, resolveAuthToken(preferredOwner) — chats belong to the account that created them                                                                                                                                                                                                |

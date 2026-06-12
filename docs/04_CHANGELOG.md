@@ -60,6 +60,38 @@ Qwen WAF блокирует все Node-fetch запросы, а browser XHR fal
 - Добавлен `navigator.languages`, `navigator.language`
 - Добавлен `permissions.query` override (anti-headless detection)
 
+## WAF обход v2: HAR-анализ и смена стратегии (Session 2026-06-12)
+
+### Проблема
+Browser XHR fallback (Path 2) тоже упирался в WAF — запросы к `/api/v2/chat/completions`
+таймаутились даже из main world. CAPTCHA resolver не помогал — WAF дропал,
+а не запрашивал верификацию.
+
+### Анализ HAR
+Сравнение реального запроса Qwen фронтенда (Chrome 149) с нашим кодом выявило:
+- ❌ Наш код отправлял `Authorization: Bearer` — реальный фронтенд НЕ шлёт Bearer
+- ❌ Наш XHR не имел WAF-заголовков `bx-ua`, `bx-umidtoken`, `bx-v`
+- ❌ Payload отличался: не было `version: "2.1"`, `feature_config` не совпадал
+- ❌ Навигация `domcontentloaded` не ждала загрузки WAF SDK
+
+### Изменения
+
+**`services/qwen/api/qwenApi.js`:**
+- `buildPayloadV2`: добавлен `version: "2.1"` в корень payload
+- `buildPayloadV2`: `research_mode: "none"` → `"normal"`, добавлены `auto_thinking`/`thinking_mode`
+- `buildPayloadV2`: удалены избыточные root-level поля (auto_search, web_search, и т.д.)
+- `buildPayloadV2`: удалён `parent_id` из объекта сообщения (только на уровне payload)
+- `executeApiRequest` (Path 2): XHR → `fetch()` в main world через WAF SDK
+- `executeApiRequest`: удалён `Authorization: Bearer` — WAF блокировал из-за него
+- `executeApiRequest`: добавлены заголовки `Version`, `source`, `X-Request-Id`, `X-Accel-Buffering`
+- `executeApiRequest`: увеличен timeout 20с → 60с (fetch дольше ждёт ответа от WAF)
+- `executeApiRequestWithNodeStreaming` (Path 1): удалён Bearer, добавлены заголовки
+- `sendMessage`: `domcontentloaded` → `networkidle0` + 2s пауза для WAF SDK
+- `sendMessage`: удалён CSP bypass и localStorage token injection (не нужны)
+- `createChatV2`: сохранён Bearer (WAF не блокирует `/chats/new`)
+- `createChatV2`: добавлены недостающие заголовки, `project_id` в body
+- `testToken`: удалён Bearer, добавлены заголовки
+
 ## DeepSeek PoW & WASM (Sessions 63–)
 
 ### Cookie истекли + WASM не найден (2026-06-12)
