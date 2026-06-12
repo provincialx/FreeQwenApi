@@ -1,7 +1,3 @@
-# ⚠ Qwen temporaly not working, captcha trouble! ⚠
-
-Working on DeepSeek integration.
-
 # FreeQwenApi — Documentation Index
 
 | File                                           | Content                                                                                                                                                                                                                              | Last updated         |
