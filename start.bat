@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title Запуск Qwen API сервера
+title ZApi — Qwen API сервер
 
 echo Проверка наличия Node.js...
 where node >nul 2>nul
@@ -36,4 +36,4 @@ echo.
 :: Запуск Node.js приложения
 node index.js
 
-pause 
+pause

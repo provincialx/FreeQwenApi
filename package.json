@@ -1,5 +1,5 @@
 {
-  "name": "free-qwen-api",
+  "name": "zapi",
   "version": "1.0.0",
   "description": "Мульти-провайдерный OpenAI-compatible API прокси (Qwen, DeepSeek)",
   "main": "index.js",
@@ -12,8 +12,8 @@
     "smoke": "node scripts/smoke_test.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "format": "prettier --write \"src/**/*.js\" index.js scripts/**/*.js tests/**/*.js",
-    "format:check": "prettier --check \"src/**/*.js\" index.js scripts/**/*.js tests/**/*.js",
+    "format": "prettier --write \"services/**/*.js\" index.js scripts/**/*.js tests/**/*.js",
+    "format:check": "prettier --check \"services/**/*.js\" index.js scripts/**/*.js tests/**/*.js",
     "test:cov": "c8 node --test --test-force-exit tests/unit/*.test.js"
   },
   "dependencies": {
