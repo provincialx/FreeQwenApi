@@ -8,7 +8,8 @@ function toBoolean(value) {
 const BASE_URL = process.env.DEEPSEEK_BASE_URL || "https://chat.deepseek.com";
 
 // ─── API URLs ────────────────────────────────────────────────────────
-export const CHAT_API_URL = process.env.DEEPSEEK_CHAT_API_URL || `${BASE_URL}/api/v0/chat/completion`;
+export const CHAT_API_URL =
+  process.env.DEEPSEEK_CHAT_API_URL || `${BASE_URL}/api/v0/chat/completion`;
 export const CHAT_PAGE_URL = process.env.DEEPSEEK_CHAT_PAGE_URL || `${BASE_URL}`;
 
 // ─── Таймауты (мс) ──────────────────────────────────────────────────
@@ -20,9 +21,20 @@ export const SESSION_DIR = process.env.SESSION_DIR || "session";
 export const ACCOUNTS_DIR = "accounts";
 
 // ─── Модели DeepSeek Web ────────────────────────────────────────────
+// model_type: default (Быстрый/V4-Flash) | expert (Эксперт/V4-Pro)
 export const DEEPSEEK_MODELS = {
-  "deepseek-v3": "default", // Standard chat model
-  "deepseek-r1": "deepthink", // Thinking/reasoning mode
+  // Обычный chat (V4 Flash — Быстрый режим)
+  "deepseek-v3": { model_type: "default", thinking_enabled: false, search_enabled: false },
+  "deepseek-chat": { model_type: "default", thinking_enabled: false, search_enabled: false },
+  "deepseek-default": { model_type: "default", thinking_enabled: false, search_enabled: false },
+
+  // Thinking / Reasoning режимы
+  "deepseek-r1": { model_type: "default", thinking_enabled: true, search_enabled: false },
+  "deepseek-reasoner": { model_type: "default", thinking_enabled: true, search_enabled: false },
+
+  // Экспертные модели (V4 Pro — Expert режим)
+  "deepseek-expert": { model_type: "expert", thinking_enabled: false, search_enabled: false },
+  "deepseek-v4-pro": { model_type: "expert", thinking_enabled: true, search_enabled: false },
 };
 
 // ─── Браузер (для аутентификации через браузер) ──────────────────────

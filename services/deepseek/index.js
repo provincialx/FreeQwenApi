@@ -10,7 +10,10 @@ import { PORT as DEFAULT_PORT, HOST as DEFAULT_HOST } from "../../shared/config.
 
 const app = express();
 
-export const port = Number.parseInt(process.env.DEEPSEEK_PORT ?? process.env.PORT ?? DEFAULT_PORT, 10);
+export const port = Number.parseInt(
+  process.env.DEEPSEEK_PORT ?? process.env.PORT ?? DEFAULT_PORT,
+  10
+);
 export const host = process.env.HOST || DEFAULT_HOST;
 
 // Middleware
@@ -18,24 +21,54 @@ app.use(logHttpRequest);
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use(bodyParser.urlencoded({ limit: "50mb", extended: true }));
 
-// CORS headers
+// CORS + Authorization middleware (Relaxed for local dev)
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
+
+  // Accept ANY auth header for localhost. Zed sends 'Bearer sk-...', some clients send custom formats.
+  const auth = req.headers.authorization;
+  console.log(`[Auth Check] Header: ${auth || "(none)"}`);
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+
   next();
 });
 
 // ─── OpenAI-compatible API routes ──────────────────────────────
 
-app.get("/api/v1/models", (_req, res) => {
+app.get("/api/v1/models", (req, res) => {
   const models = [
-    { id: "deepseek-v3", object: "model" },
-    { id: "deepseek-r1", object: "model" }, // Thinking/reasoning mode
+    { id: "deepseek-v3", object: "model" }, // V4 Flash — Быстрый
+    { id: "deepseek-chat", object: "model" }, // Alias
+    { id: "deepseek-r1", object: "model" }, // Thinking mode (V4 Flash + reasoning)
+    { id: "deepseek-reasoner", object: "model" }, // Alias for R1
+    { id: "deepseek-expert", object: "model" }, // V4 Pro — Эксперт
+    { id: "deepseek-v4-pro", object: "model" }, // V4 Pro — Эксперт + reasoning
   ];
 
+  logInfo(`GET /api/v1/models (client: ${req.ip})`);
   return res.json({ object: "list", data: models });
+});
+
+// Health check / GET method helper for API endpoint testing via browser
+app.get("/api/v1/chat/completions", (_req, res) => {
+  return res.json({
+    status: "ok",
+    message: "DeepSeek Proxy запущен. Используйте POST для запросов к chat completions.",
+    models_available: [
+      "deepseek-v3",
+      "deepseek-chat",
+      "deepseek-r1",
+      "deepseek-reasoner",
+      "deepseek-expert",
+      "deepseek-v4-pro",
+    ],
+  });
 });
 
 // Main chat endpoint — OpenAI compatible
@@ -80,11 +113,9 @@ app.post("/api/v1/chat/completions", async (req, res) => {
       // Non-streaming: wait for full response, then return standard OpenAI format
       let capturedContent = "";
 
-      await sendMessage(
-        [{ role: "user", content: userMsg.content }],
-        model,
-        (chunk) => { capturedContent += chunk; }
-      );
+      await sendMessage([{ role: "user", content: userMsg.content }], model, (chunk) => {
+        capturedContent += chunk;
+      });
 
       const completionTokens = estimateTokens(capturedContent);
 
@@ -129,22 +160,18 @@ app.post("/api/v1/chat/completions", async (req, res) => {
 
     let fullContent = "";
 
-    await sendMessage(
-      [{ role: "user", content: userMsg.content }],
-      model,
-      (chunk) => {
-        fullContent += chunk;
-        const dataChunk = buildSSE({
-          id: completionId,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, delta: { content: chunk } }],
-        });
+    await sendMessage([{ role: "user", content: userMsg.content }], model, (chunk) => {
+      fullContent += chunk;
+      const dataChunk = buildSSE({
+        id: completionId,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, delta: { content: chunk } }],
+      });
 
-        if (!res.writableEnded) res.write(dataChunk);
-      }
-    );
+      if (!res.writableEnded) res.write(dataChunk);
+    });
 
     // Final [DONE] chunk
     const doneChunk = buildSSE({
@@ -158,9 +185,10 @@ app.post("/api/v1/chat/completions", async (req, res) => {
     if (!res.writableEnded) {
       res.write(doneChunk);
       res.end();
-      logInfo(`DeepSeek ${model}: ответ за ${(Date.now() - startTime / 1000).toFixed(1)}с (${fullContent.length} симв)`);
+      logInfo(
+        `DeepSeek ${model}: ответ за ${(Date.now() - startTime / 1000).toFixed(1)}с (${fullContent.length} симв)`
+      );
     }
-
   } catch (err) {
     if (!res.writableEnded) {
       res.json({ error: "Ошибка генерации", details: err.message });
@@ -179,14 +207,19 @@ function estimateTokens(text) {
   // Rough estimation — ~1 token per word + extra for special chars
   if (!text) return 0;
   const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-  const otherWords = text.replace(/[\u4e00-\u9fff]/g, "").split(/\s+/).filter(Boolean).length;
+  const otherWords = text
+    .replace(/[\u4e00-\u9fff]/g, "")
+    .split(/\s+/)
+    .filter(Boolean).length;
   return chineseChars + Math.ceil(otherWords * 1.2);
 }
 
-// Error handling middleware
-app.use((err, req, res) => {
+// Error handling middleware (requires exactly 4 params for Express to recognize it)
+app.use((err, req, res, _next) => {
   logError("Внутренняя ошибка сервера", err);
-  res.status(500).json({ error: "Внутренняя ошибка сервера" });
+  if (!res.headersSent) {
+    res.status(500).json({ error: "Внутренняя ошибка сервера" });
+  }
 });
 
 export function showAccountMenu() {
@@ -233,7 +266,9 @@ export async function startDeepSeekProxy() {
       const displayHost = host === "0.0.0.0" ? "localhost" : host;
       console.log(`\n🚀 DeepSeek API запущен на http://${displayHost}:${port}`);
       logInfo(`API доступен по адресу: http://localhost:${port}/api/v1/chat/completions`);
-      logInfo("Модели: deepseek-v3 (обычная), deepseek-r1 (thinking)");
+      logInfo(
+        "Модели: deepseek-v3 (V4 Flash), deepseek-r1 (Thinking), deepseek-expert (V4 Pro), deepseek-v4-pro (Pro+Thinking)"
+      );
     });
   } catch (err) {
     if (err.code === "EADDRINUSE") {
@@ -245,6 +280,26 @@ export async function startDeepSeekProxy() {
 }
 
 // Graceful shutdown
-process.on("SIGINT", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));
-process.on("uncaughtException", (err) => { logError("Необработанное исключение", err); process.exit(1); });
+let _shuttingDown = false;
+function safeShutdown() {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  process.exit(0);
+}
+
+process.on("SIGINT", safeShutdown);
+process.on("SIGTERM", safeShutdown);
+process.on("uncaughtException", (err) => {
+  logError("Необработанное исключение", err);
+  process.exit(1);
+});
+
+// If started directly as CLI entry:
+const isMainModule =
+  process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, "/"));
+if (isMainModule) {
+  startDeepSeekProxy().catch((error) => {
+    logError("Ошибка при запуске сервера DeepSeek", error);
+    process.exit(1);
+  });
+}
