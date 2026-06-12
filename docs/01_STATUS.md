@@ -1,10 +1,11 @@
 # FreeQwenApi — Status (2026-06-12)
 
-## Health: YELLOW — WAF блокирует `chat/completions` даже из браузера
+## Health: YELLOW — DeepSeek Cookie restore + PoW fixes (2026-06-12)
 
-Multi-provider proxy architecture operational. HAR-анализ (Session 2026-06-12) выявил ключевые
-отличия от реального Qwen фронтенда: Bearer-токен в заголовках и отсутствие WAF SDK.
-После правок — тестируем новую стратегию: `fetch()` через WAF SDK вместо кастомного XHR.
+DeepSeek: исправлено восстановление session cookie `ds_session_id`. Ранняя проверка auth
+(`checkAuthViaApi`) теперь не блокирует запрос — PoW решается лениво в `sendViaBrowser`.
+Добавлен retry поиска WASM URL с триггером prefetch через challenge. Улучшен anti-detection.
+Qwen: без изменений.
 
 ### Architecture S61+: Multi-Provider Separation
 

@@ -118,31 +118,42 @@ app.post("/api/v1/chat/completions", async (req, res) => {
 
   const startTime = Date.now();
 
-  // Init browser page on first request
+  // Init browser page on first request (PoW solving happens lazily in sendViaBrowser)
   await initBrowserPage();
 
   try {
-    // Send message through authenticated browser context (bypasses PoW validation)
+    // Send message through browser context (handles PoW + auth internally)
     const apiResult = await sendViaBrowser(messages, model, conversationHint);
 
     if (!apiResult?.success) {
-      logWarn(`DeepSeek ${model}: Browser API returned error — ${apiResult.error}`);
-      return res.status(502).json({ error: apiResult.error });
+      const errMsg = apiResult?.error || "Unknown error";
+      logWarn(`DeepSeek ${model}: Browser API error — ${errMsg}`);
+
+      // If the error indicates auth failure (INVALID_TOKEN, HTTP 400 etc.), suggest re-login
+      if (/token|auth|session/i.test(errMsg) || /401|403/.test(errMsg)) {
+        return res.status(401).json({
+          error: `Сессия истекла: ${errMsg}. Требуется повторная авторизация (меню → пункт 1).`,
+        });
+      }
+
+      return res.status(502).json({ error: errMsg });
     }
 
     const fullContent = apiResult.data.content || "";
 
-    // Debug only: diagnose empty responses from browser proxy
-    if (!fullContent && apiResult._debug) {
+    // Debug: diagnose short responses (likely error from DeepSeek API)
+    if (apiResult._debug) {
       const dbg = apiResult._debug;
-      logWarn(`[Debug] Пустой ответ! contentType=${dbg.contentType}`);
-      if (dbg.keys) logInfo(`[Debug] JSON keys: ${dbg.keys.join(", ")}`);
-      if (dbg.sample)
-        logInfo(
-          `[Debug] Sample (${dbg.rawLength ?? dbg.sample.length}): ${dbg.sample?.slice(0, 500) || ""}`
-        );
-      if (dbg.firstChunk)
-        logInfo(`[Debug] First SSE chunk keys: ${JSON.stringify(dbg.firstChunk.keys)}`);
+      if (!fullContent || fullContent.length < 100) {
+        logWarn(`[Debug] Ответ ${fullContent.length}сим: type=${dbg.contentType}`);
+        if (dbg.keys) logInfo(`[Debug] JSON keys: ${dbg.keys.join(", ")}`);
+        if (dbg.sample)
+          logInfo(
+            `[Debug] Sample (${dbg.rawLength ?? dbg.sample.length}): ${dbg.sample?.slice(0, 500) || ""}`
+          );
+        if (dbg.firstChunk)
+          logInfo(`[Debug] First SSE chunk keys: ${JSON.stringify(dbg.firstChunk.keys)}`);
+      }
     }
 
     if (!isStreaming) {

@@ -10,6 +10,7 @@ import { fileURLToPath } from "url";
 
 import { logInfo, logWarn, logDebug } from "../../../shared/logger/index.js";
 import { CHAT_PAGE_URL, DEEPSEEK_MODELS } from "../config.js";
+import { solvePoW } from "../utils/powSolver.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ACCOUNTS_PATH = path.resolve(__dirname, "..", "..", "session"); // Project root session/
@@ -34,11 +35,8 @@ function resolveActiveFile() {
 
 let browser = null;
 let page = null;
+let pageReady = false; // true only after initBrowserPage completes fully
 let cdpSession = null; // CDP session for network interception
-let activeInterceptId = null; // Pending request ID to intercept
-let interceptedRequest = null; // Captured { requestId, url, headers }
-let proxyWasmUrl = null; // WASM URL captured from page resources via CDP
-
 // Cached session data loaded once at init
 let cachedAuthData = {};
 let cachedStorage = { ls: {}, ss: {} };
@@ -117,28 +115,77 @@ async function checkAuthViaApi(page) {
     );
 
     if (!hasAuthCookie) {
-      // Debug: show what cookies we actually have
       const cookieNames = allCookies.map((c) => c.name);
       logDebug(
         `[BrowserProxy] Cookie на странице (${allCookies.length}): ${cookieNames.join(", ")}`
       );
     }
 
-    if (hasAuthCookie) return true;
+    if (!hasAuthCookie) {
+      // Fallback: check for userToken in restored localStorage
+      try {
+        const ls = await page.evaluate(() => {
+          const token = localStorage.getItem("userToken");
+          return token ? JSON.parse(token)?.value || "" : "";
+        });
+        if (ls) {
+          logInfo(`[BrowserProxy] Fallback: userToken найден в localStorage`);
+        } else {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
 
-    // Fallback: check for userToken in restored localStorage
+    // Validate cookies via lightweight API call — cookies may exist but be stale/expired
     try {
-      const ls = await page.evaluate(() => {
-        const token = localStorage.getItem("userToken");
-        return token ? JSON.parse(token)?.value || "" : "";
+      const valid = await page.evaluate(async () => {
+        const resp = await fetch("https://chat.deepseek.com/api/v0/chat_session/create", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            Accept: "*/*",
+            "Content-Type": "application/json;charset=UTF-8",
+            Origin: "https://chat.deepseek.com",
+            Referer: "https://chat.deepseek.com/",
+            "Accept-Language": "en-US,en;q=0.9",
+            "x-client-platform": "web",
+          },
+          body: JSON.stringify({}),
+        });
+        const text = await resp.text();
+        if (resp.ok) {
+          // Check for auth errors in JSON response body
+          try {
+            const json = JSON.parse(text);
+            if (
+              json?.code === 40003 ||
+              (json?.msg && String(json.msg).toLowerCase().includes("token"))
+            ) {
+              return false;
+            }
+          } catch {}
+          return true;
+        }
+        if (resp.status === 400) {
+          // HTTP 400 may be mis-param, not auth error — check body
+          if (text.includes("INVALID_TOKEN") || text.toLowerCase().includes("token")) return false;
+          return true;
+        }
+        return false;
       });
-      if (ls) {
-        logInfo(`[BrowserProxy] Fallback: userToken найден в localStorage`);
+      if (valid) {
+        logInfo("✅ Браузерная страница готова (авторизован)");
         return true;
       }
-    } catch {}
-
-    return false;
+      logWarn("[BrowserProxy] 🔴 Cookie истекли (API проверка не прошла)");
+      return false;
+    } catch (apiErr) {
+      logDebug(`[BrowserProxy] API проверка недоступна: ${apiErr.message}`);
+      // If API check fails, trust cookie presence as best-effort
+      return hasAuthCookie;
+    }
   } catch (e) {
     logDebug(`[BrowserProxy] Cookie проверка недоступна: ${e.message}`);
     // Fallback: check if we have userToken in restored localStorage
@@ -151,44 +198,12 @@ async function checkAuthViaApi(page) {
   }
 }
 
-/** Enable CDP network capture during proxy initialization.
- * Lightweight — captures WASM resources and PoW headers from page load.
- */
-async function enableProxyNetworkCapture(page) {
-  try {
-    cdpSession = await page.createCDPSession();
-    await cdpSession.send("Network.enable", { maxPostDataSize: 65536 });
-    proxyWasmUrl = null;
-
-    // Track resource loading — find WASM files (exclude Cloudflare Turnstile)
-    const wasmFilter = /\.wasm/i;
-    const notCloudflare = (url) => !/cloudflare|turnstile/i.test(url);
-
-    cdpSession.on("Network.requestWillBeSent", (params) => {
-      const url = params.request?.url || "";
-      if (!proxyWasmUrl && wasmFilter.test(url) && notCloudflare(url)) {
-        proxyWasmUrl = url;
-        logInfo(`[BrowserProxy] CDP: WASM resource найден — ${url.slice(0, 120)}`);
-      }
-    });
-
-    // Capture response headers (may contain WAF challenge info)
-    cdpSession.on("Network.responseReceived", (params) => {
-      const url = params.response?.url || "";
-      if (!proxyWasmUrl && wasmFilter.test(url) && notCloudflare(url)) {
-        proxyWasmUrl = url;
-        logInfo(`[BrowserProxy] CDP response: WASM resource найден — ${url.slice(0, 120)}`);
-      }
-    });
-
-    logDebug("[BrowserProxy] CDP network observer enabled (lightweight)");
-  } catch (e) {
-    logWarn(`[BrowserProxy] Network capture failed: ${e.message}`);
-  }
-}
-
 // ─── Context setup: must run BEFORE page creation ──────────
 let contextSetupDone = false;
+
+// Windows Chrome 131 stable user-agent for realistic fingerprint
+const DEFAULT_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 async function setupExecutionContext() {
   if (contextSetupDone) return;
@@ -197,12 +212,28 @@ async function setupExecutionContext() {
   puppeteer.use(StealthPlugin());
   browser = await puppeteer.launch({
     headless: "new",
-    args: ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+    args: [
+      "--no-sandbox",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--disable-web-security",
+      "--disable-features=BlockInsecurePrivateNetworkRequests",
+    ],
   });
 }
 
 export async function initBrowserPage() {
-  if (page) return true;
+  if (page && pageReady) return true;
+  if (page && !pageReady) {
+    // Page exists but still initializing — wait for it
+    logInfo("[BrowserProxy] Ожидание завершения инициализации страницы...");
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      if (pageReady) return true;
+    }
+    logWarn("[BrowserProxy] Таймаут ожидания инициализации страницы");
+    return false;
+  }
 
   try {
     // Step 1: Setup browser context first
@@ -224,21 +255,95 @@ export async function initBrowserPage() {
     page = await browser.newPage();
     await page.setViewport({ width: 1920, height: 1080 });
 
-    // CRITICAL: Restore localStorage BEFORE cookies — some DeepSeek features depend on it
+    // Set realistic Chrome user-agent (important for DeepSeek WAF)
+    await page.setUserAgent(DEFAULT_UA);
+
+    // ─── Anti-detection measures (Qwen-style) ───────────────────────────
+    // DeepSeek WAF may detect headless/automated browser and invalidate session.
+    // These overrides run before any page scripts.
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      if (!window.chrome) {
+        window.chrome = {
+          runtime: {},
+          app: {},
+          csi: () => {},
+          loadTimes: () => {},
+        };
+      }
+      Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+      Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
+      Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+      Object.defineProperty(navigator, "language", { get: () => "en-US" });
+      Object.defineProperty(navigator, "plugins", {
+        get: () => [
+          {
+            0: {
+              type: "application/x-google-chrome-pdf",
+              suffixes: "pdf",
+              description: "Portable Document Format",
+            },
+            description: "Portable Document Format",
+            filename: "internal-pdf-viewer",
+            length: 1,
+            name: "Chrome PDF Plugin",
+          },
+        ],
+      });
+    });
+
+    // CRITICAL: Restore localStorage BEFORE any navigation — DeepSeek features depend on it
     if (cachedStorage.ls && Object.keys(cachedStorage.ls).length > 0) {
       await restoreLocalStorage(page, cachedStorage);
     }
 
-    // Restore cookies BEFORE navigation (browser sends them with the request)
-    if (savedSession && savedSession.cookies.length > 0) {
-      await page.setCookie(...savedSession.cookies);
-      logInfo(`[BrowserProxy] Загружено ${savedSession.cookies.length} cookie из сессии`);
+    // Step 3: Enable CDP session early for cookie restoration (bypass domain restrictions)
+    try {
+      cdpSession = await page.createCDPSession();
+      await cdpSession.send("Network.enable", { maxPostDataSize: 65536 });
+    } catch (e) {
+      logWarn(`[BrowserProxy] CDP init failed: ${e.message}`);
     }
 
-    // Step 4: Enable CDP network capture to intercept WASM + PoW headers during page load
-    await enableProxyNetworkCapture(page);
+    // Restore cookies BEFORE navigation — use CDP to bypass domain restrictions
+    // (page.setCookie may silently drop cookies for domains different from current page URL)
+    if (savedSession && savedSession.cookies.length > 0) {
+      try {
+        logInfo(`[BrowserProxy] Установка ${savedSession.cookies.length} cookie через CDP...`);
+        for (const c of savedSession.cookies) {
+          // Session cookie params for CDP (omit expires for session cookies)
+          const cookieParams = {
+            name: c.name,
+            value: c.value,
+            domain: c.domain || ".deepseek.com",
+            path: c.path || "/",
+            secure: c.secure ?? true,
+            httpOnly: c.httpOnly ?? false,
+            sameSite: c.sameSite || "Lax",
+          };
+          // Include expires only for non-session cookies
+          if (!c.session && c.expires && c.expires > 0) {
+            cookieParams.expires = c.expires;
+          }
+          // Restore ALL cookies including session-only (ds_session_id is critical for auth)
+          await cdpSession.send("Network.setCookie", cookieParams);
+        }
+        // Verify by reading back
+        const verifyCookies = await page.cookies();
+        logInfo(`[BrowserProxy] После CDP установки: ${verifyCookies.length} cookie на странице`);
+        const cookieNames = verifyCookies.map(
+          (c) => `${c.name}=${(c.value || "").slice(0, 20)}... (${c.domain})`
+        );
+        logWarn(`[BrowserProxy] Cookie ДО навигации: ${cookieNames.join(", ")}`);
+      } catch (e) {
+        logWarn(`[BrowserProxy] CDP cookie restore failed: ${e.message}`);
+        // Fallback: try page.setCookie
+        await page.setCookie(...savedSession.cookies).catch(() => {});
+      }
+    }
 
-    // Navigate to DeepSeek
+    // Step 4: Navigate to DeepSeek
     await page.goto(CHAT_PAGE_URL, { waitUntil: "networkidle2", timeout: 30_000 });
 
     // Wait for ALL resources to load (including .wasm which DeepSeek fetches dynamically)
@@ -247,23 +352,33 @@ export async function initBrowserPage() {
       return new Promise((resolve) => setTimeout(resolve, 5000));
     });
 
-    // Log captured PoW data from network interception
-    if (proxyWasmUrl) {
-      logInfo(`[BrowserProxy] WASM URL найден через CDP: ${proxyWasmUrl.slice(0, 80)}...`);
+    // Debug: check cookies after navigation — WAF may refresh/replace them
+    try {
+      const afterCookies = await page.cookies();
+      const afterNames = afterCookies.map(
+        (c) => `${c.name}=${c.value.slice(0, 20)}... (${c.domain})`
+      );
+      logWarn(
+        `[BrowserProxy] Cookie после навигации (${afterCookies.length}): ${afterNames.join(", ")}`
+      );
+    } catch (e) {
+      logDebug(`[BrowserProxy] Не удалось прочитать cookie: ${e.message}`);
     }
 
-    // Step 5: Reliable auth check via API instead of document.cookie sniffing
-    const loggedIn = await checkAuthViaApi(page);
-
-    if (!loggedIn) {
-      logWarn("[BrowserProxy] 🔴 Cookie истекли! Запустите авторизацию заново (меню → пункт 1)");
+    // Step 5: Informational auth check — WAF may still be challenging at this point
+    // (PoW not yet solved, so API calls will fail until PoW is handled in sendViaBrowser)
+    // This check is for diagnostics only; does NOT block the request.
+    const loggedIn = await checkAuthViaApi(page).catch(() => false);
+    if (loggedIn) {
+      logInfo("[BrowserProxy] ✅ Сессия валидна (preflight)");
     } else {
-      logInfo("✅ Браузерная страница готова (авторизован)");
+      logDebug("[BrowserProxy] Preflight auth check failed (expected — PoW not yet solved)");
     }
   } catch (err) {
     logWarn("[BrowserProxy] Ошибка инициализации:", err.message);
   }
 
+  if (page) pageReady = true;
   return !!page;
 }
 
@@ -334,117 +449,8 @@ async function ensureSession(conversationHint) {
   return fallback;
 }
 
-/** Find WASM URL in the page context using multiple strategies */
-async function findWasmUrl() {
-  // Priority 0: Use CDP-captured URL (most reliable — captures ALL resource requests)
-  if (proxyWasmUrl) return proxyWasmUrl;
-
-  if (!page) return null;
-
-  const wasmUrlResult = await page.evaluate(async function () {
-    const isWasmUrl = (url) => {
-      if (/cloudflare|turnstile/i.test(url)) return false;
-      return /\.wasm/i.test(url);
-    };
-
-    try {
-      // Method 1: Check performance API for .wasm resources
-      const entries = performance.getEntriesByType("resource");
-      for (const entry of entries) {
-        if (isWasmUrl(entry.name)) return entry.name;
-      }
-    } catch {}
-
-    try {
-      // Method 1b: Extended — search all resources for solve/pow/challenge + .wasm suffix
-      const entries = performance.getEntriesByType("resource");
-      for (const entry of entries) {
-        if (/solve|pow/i.test(entry.name) && isWasmUrl(entry.name)) return entry.name;
-      }
-    } catch {}
-
-    try {
-      // Method 2: Check all scripts for wasm-related names
-      for (const script of document.querySelectorAll("script[src]")) {
-        const src = script.src;
-        if ((/wasm/i.test(src) || /solve/i.test(src)) && isWasmUrl(src)) return src;
-      }
-    } catch {}
-
-    try {
-      // Method 3: Look for wasm URLs in global variables set by the app
-      const win = window;
-      if (win.__DS_WASM_URL__ && isWasmUrl(win.__DS_WASM_URL__)) return win.__DS_WASM_URL__;
-      if (win.deepseekWasmUrl && isWasmUrl(win.deepseekWasmUrl)) return win.deepseekWasmUrl;
-    } catch {}
-
-    try {
-      // Method 4: Check loaded modules from service worker or caches
-      const winCaches = window.caches;
-      for (const cacheName of ["ds-cache", "pow-cache", "app-cache"]) {
-        if (winCaches) {
-          const cache = await winCaches.open(cacheName);
-          const keys = await cache.keys();
-          for (const req of keys) {
-            if (/\.wasm/i.test(req.url)) return req.url;
-          }
-        }
-      }
-    } catch {}
-
-    try {
-      // Method 5: DeepSeek may store wasm URL in localStorage or sessionStorage after loading
-      const lsKeys = Object.keys(localStorage);
-      for (const key of lsKeys) {
-        if (/wasm/i.test(key)) return localStorage.getItem(key);
-      }
-      const ssKeys = Object.keys(sessionStorage);
-      for (const key of ssKeys) {
-        if (/wasm/i.test(key)) return sessionStorage.getItem(key);
-      }
-    } catch {}
-
-    // Method 6: Search in server config stored by APMPlus — may contain wasm CDN path
-    try {
-      const serverConfig = localStorage.getItem("APMPLUS__cache__server__config__675113");
-      if (serverConfig) {
-        const parsed = JSON.parse(serverConfig);
-        const str = JSON.stringify(parsed);
-        // Look for .wasm URLs in the config string
-        const matches = str.match(/https?:\/\/[^"]*\.wasm[^"]*/gi);
-        if (matches && isWasmUrl(matches[0])) return matches[0];
-      }
-    } catch {}
-
-    try {
-      // Method 7: Remote feature store may have wasm URL hints
-      const featureStore = localStorage.getItem("__ds_remote_feature_store");
-      if (featureStore) {
-        const parsed = JSON.parse(featureStore);
-        const str = JSON.stringify(parsed);
-        const matches = str.match(/https?:\/\/[^"]*\.wasm[^"]*/gi);
-        if (matches && isWasmUrl(matches[0])) return matches[0];
-      }
-    } catch {}
-
-    // Debug: dump all resource names to help identify WASM location
-    try {
-      const entries = performance.getEntriesByType("resource");
-      const wasmCandidates = entries.filter((e) => isWasmUrl(e.name));
-      if (wasmCandidates.length > 0 && wasmCandidates.length < 20) {
-        // Return first non-filtered match as last resort
-        return wasmCandidates[0]?.name;
-      }
-    } catch {}
-
-    return null;
-  });
-
-  return wasmUrlResult;
-}
-
 export async function sendViaBrowser(messages, model, conversationHint) {
-  if (!page) {
+  if (!page || !pageReady) {
     logWarn("[BrowserProxy] Страница не инициализирована.");
     return { success: false, error: "Нет активной страницы браузера" };
   }
@@ -481,92 +487,96 @@ export async function sendViaBrowser(messages, model, conversationHint) {
     // Auth data from cached session
     const authData = { ...cachedAuthData };
 
-    // Find WASM URL inside the browser context (DeepSeek loads it dynamically on every visit)
-    logInfo("[BrowserProxy] Поиск WASM модуля для PoW...");
-    let wasmUrlResult = await findWasmUrl();
+    // ─── PoW: Solve via Node.js SHA3-256 solver (no WASM needed) ──
+    logInfo("[BrowserProxy] Решение PoW (SHA3-256, Node.js)...");
+    let powResponseHeader = "";
+    try {
+      // Step 1: Get challenge from DeepSeek via browser (needs cookies)
+      const challengeData = await page.evaluate(async () => {
+        const results = [];
 
-    // Validate: must end with .wasm (not a JS wrapper like Cloudflare Turnstile)
-    if (!String(wasmUrlResult).endsWith(".wasm")) {
-      logWarn(
-        `[BrowserProxy] Найдено не WASM бинарное, а ${wasmUrlResult.split("/").pop().split("?")[0].slice(0, 30)} — пропуск PoW`
-      );
-      wasmUrlResult = null;
+        // Get Bearer token from localStorage (required for challenge endpoint)
+        let bearerToken = "";
+        try {
+          const raw = localStorage.getItem("userToken");
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            bearerToken = parsed?.value || raw;
+          }
+        } catch {}
+
+        const authHeaders = {
+          "Content-Type": "application/json;charset=UTF-8",
+          Origin: "https://chat.deepseek.com",
+          Referer: "https://chat.deepseek.com/",
+        };
+        if (bearerToken) {
+          authHeaders["Authorization"] = `Bearer ${bearerToken}`;
+        }
+
+        // Try multiple target_path values (the path to be called with PoW response)
+        const targetPaths = [
+          "https://chat.deepseek.com/api/v0/chat/completion",
+          "/api/v0/chat/completion",
+          "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
+          "",
+        ];
+        const chalUrl = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
+
+        for (const tPath of targetPaths) {
+          try {
+            const bodyData = tPath ? { target_path: tPath } : {};
+            const chalResp = await fetch(chalUrl, {
+              method: "POST",
+              credentials: "include",
+              headers: authHeaders,
+              body: JSON.stringify(bodyData),
+            });
+            const raw = await chalResp.text();
+            results.push({
+              target_path: tPath || "(empty)",
+              status: chalResp.status,
+              body: raw.slice(0, 400),
+            });
+            if (chalResp.ok) {
+              try {
+                const chalData = JSON.parse(raw);
+                const challenge =
+                  chalData?.data?.biz_data?.challenge ||
+                  chalData?.data?.challenge ||
+                  chalData?.challenge ||
+                  null;
+                if (challenge) return { challenge, endpoint: chalUrl, targetPath: tPath };
+              } catch {}
+            }
+          } catch (e) {
+            results.push({ target_path: tPath || "(empty)", error: e.message });
+          }
+        }
+        return { error: "No challenge from any endpoint", debug: results };
+      });
+
+      if (challengeData.error) {
+        logWarn(`[BrowserProxy] Challenge request failed: ${challengeData.error}`);
+        if (challengeData.debug) {
+          for (const d of challengeData.debug) {
+            logWarn(
+              `[BrowserProxy]   → ${d.url}: HTTP ${d.status || "ERR"} ${d.body || d.error || ""}`
+            );
+          }
+        }
+      } else {
+        // Step 2: Solve PoW in Node.js (pure SHA3-256, no WASM)
+        const result = solvePoW(challengeData.challenge);
+        powResponseHeader = result.powData;
+        logInfo(`[BrowserProxy] ✅ PoW решён (nonce=${result.nonce})`);
+      }
+    } catch (e) {
+      logWarn(`[BrowserProxy] PoW solving error: ${e.message}`);
     }
 
-    let powResponseHeader = "";
-    if (wasmUrlResult) {
-      logInfo(`[BrowserProxy] WASM найден: ${wasmUrlResult.slice(0, 60)}...`);
-
-      // Solve PoW challenge INSIDE the browser context using real WASM solver
-      powResponseHeader = await page.evaluate(async (url) => {
-        try {
-          const baseUrl = "https://chat.deepseek.com/api/v0/chat/completion";
-
-          // 1. Get challenge
-          const chalResp = await fetch(baseUrl + "/create_pow_challenge", {
-            method: "POST",
-            credentials: "include",
-            headers: { "Content-Type": "application/json;charset=UTF-8" },
-            body: JSON.stringify({ target_path: baseUrl }),
-          });
-
-          if (!chalResp.ok) throw new Error(`Challenge failed HTTP ${chalResp.status}`);
-          const chalData = await chalResp.json();
-          const challenge = chalData?.data?.biz_data?.challenge;
-          if (!challenge) throw new Error("No challenge in response");
-
-          // 2. Load and run WASM solver (same logic as chat.js)
-          const wasmResp = await fetch(url);
-          const wasmBytes = await wasmResp.arrayBuffer();
-          const { instance } = await WebAssembly.instantiate(wasmBytes, { wbg: {} });
-          const e = instance.exports;
-
-          const encoder = new TextEncoder();
-          const prefix = challenge.salt + "_" + (challenge.expire_at || "") + "_";
-          const cBytes = encoder.encode(challenge.challenge);
-          const pBytes = encoder.encode(prefix);
-
-          const cP = e.__wbindgen_export_0(cBytes.length, 1) >>> 0;
-          const pP = e.__wbindgen_export_0(pBytes.length, 1) >>> 0;
-          new Uint8Array(e.memory.buffer, cP, cBytes.length).set(cBytes);
-          new Uint8Array(e.memory.buffer, pP, pBytes.length).set(pBytes);
-
-          const sp = e.__wbindgen_add_to_stack_pointer(-16);
-          if (typeof e.wasm_solve !== "function") throw new Error("wasm_solve not found");
-          e.wasm_solve(sp, cP, cBytes.length, pP, pBytes.length, challenge.difficulty || 4096);
-
-          const dv = new DataView(e.memory.buffer);
-          const code = dv.getInt32(sp, true);
-          const ans = dv.getFloat64(sp + 8, true);
-          e.__wbindgen_add_to_stack_pointer(16);
-
-          if (code === 0 || !Number.isFinite(ans) || ans <= 0)
-            throw new Error(`PoW solve failed (code=${code}, ans=${ans})`);
-
-          // 3. Encode as Base64 for header
-          const powData = JSON.stringify({
-            algorithm: challenge.algorithm,
-            challenge: challenge.challenge,
-            salt: challenge.salt,
-            answer: Math.floor(ans),
-            signature: challenge.signature || "",
-            target_path: baseUrl,
-          });
-
-          return btoa(unescape(encodeURIComponent(powData))); // safe Base64 in browser
-        } catch (err) {
-          console.warn("[PoW] Solve failed:", err.message);
-          return null;
-        }
-      }, wasmUrlResult);
-
-      if (powResponseHeader) {
-        logInfo("[BrowserProxy] ✅ PoW решён успешно");
-      } else {
-        logWarn("[BrowserProxy] ⚠️ Не удалось решить PoW — пробуем без заголовка");
-      }
-    } else {
-      logWarn("[BrowserProxy] ⚠️ WASM модуль не найден — PoW пропущен");
+    if (!powResponseHeader) {
+      logWarn("[BrowserProxy] ⚠️ PoW не решён — запрос без X-DS-PoW-Response");
     }
 
     // Pass PoW header + auth headers into the evaluation context
@@ -792,6 +802,11 @@ export async function sendViaBrowser(messages, model, conversationHint) {
   }
 }
 
+export async function checkPageAuth() {
+  if (!page || !pageReady) return false;
+  return checkAuthViaApi(page);
+}
+
 export async function shutdownBrowser() {
   if (browser) {
     await browser.close().catch(() => {});
@@ -799,6 +814,7 @@ export async function shutdownBrowser() {
     page = null;
   }
   // Reset all state so next init reloads fresh session data
+  pageReady = false;
   contextSetupDone = false;
   cachedAuthData = {};
   cachedStorage = { ls: {}, ss: {} };

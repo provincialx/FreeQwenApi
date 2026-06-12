@@ -328,12 +328,19 @@ function extractHifFromCaptured(capturedHeaders = {}) {
 }
 async function extractSessionToAccount(page, networkData = {}) {
   try {
-    // Try specific domain first, fallback to ALL cookies (DeepSeek may set on .deepseek.com)
+    // Get cookies from BOTH domains — DeepSeek sets aws-waf-token on .deepseek.com
+    // and ds_session_id on chat.deepseek.com. Must merge both.
     let cookies = await page.cookies(CHAT_PAGE_URL);
-    if (!cookies.length) {
-      logWarn("[Auth] Куки для точного домена не найдены — получаю все куки страницы");
-      cookies = await page.cookies(); // No domain filter
+    const allCookies = await page.cookies();
+    // Merge: prefer chat.deepseek.com specificity, but include .deepseek.com root cookies
+    const cookieMap = new Map();
+    for (const c of allCookies) {
+      cookieMap.set(`${c.name}@${c.domain}`, c);
     }
+    for (const c of cookies) {
+      cookieMap.set(`${c.name}@${c.domain}`, c);
+    }
+    cookies = [...cookieMap.values()];
 
     if (!cookies.length) {
       logError("[Auth] Нет cookie на странице. Возможно, вход не прошёл.");
@@ -712,11 +719,12 @@ export async function addAccountInteractive() {
         }
       } catch {}
 
-      // Method 1b: Extended search — solve, pow, challenge patterns
+      // Method 1b: Extended search — solve, pow, challenge patterns (must end with .wasm)
       try {
         const entries = performance.getEntriesByType("resource");
         for (const entry of entries) {
-          if (/solve|pow|challenge/i.test(entry.name)) return entry.name;
+          if (/solve|pow|challenge/i.test(entry.name) && /\.wasm/i.test(entry.name))
+            return entry.name;
         }
       } catch {}
 
@@ -755,10 +763,12 @@ export async function addAccountInteractive() {
         }
       } catch {}
 
-      // Method 6: Dump candidates as last resort
+      // Method 6: Dump candidates as last resort (must end with .wasm)
       try {
         const entries = performance.getEntriesByType("resource");
-        const candidates = entries.filter((e) => /wasm|pow|solve|challenge/i.test(e.name));
+        const candidates = entries.filter(
+          (e) => /\.wasm/i.test(e.name) && /wasm|pow|solve|challenge/i.test(e.name)
+        );
         if (candidates.length > 0 && candidates.length < 20) return candidates[0].name;
       } catch {}
 
@@ -766,10 +776,12 @@ export async function addAccountInteractive() {
     });
 
     // === Merge: priority order for each field ===
+    // CDP network capture (network-level, filters for ".wasm" exactly) is most reliable.
+    // resourceWasm (page.evaluate) may have false positives (e.g., api.js with "challenge" in URL)
     const mergedPoW = {
       hif_dliq: jsHif.hif_dliq || cdpPoW.hif_dliq || "",
       hif_leim: jsHif.hif_leim || cdpPoW.hif_leim || "",
-      wasmUrl: resourceWasm || cdpPoW.wasmUrl || "", // Resource-based is most reliable
+      wasmUrl: cdpPoW.wasmUrl || resourceWasm || "",
     };
 
     logInfo(
