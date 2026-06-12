@@ -2,8 +2,8 @@
 import express from "express";
 import bodyParser from "body-parser";
 
-import { sendMessage } from "./api/chat.js";
 import { addAccountInteractive, clearSession, hasValidSession } from "./browser/auth.js";
+import { initBrowserPage, sendViaBrowser, shutdownBrowser } from "./browser/proxyPage.js";
 import { logHttpRequest, logInfo, logError, logWarn } from "../../shared/logger/index.js";
 import { prompt } from "../../shared/utils/prompt.js";
 import { PORT as DEFAULT_PORT, HOST as DEFAULT_HOST } from "../../shared/config.js";
@@ -77,6 +77,9 @@ app.post("/api/v1/chat/completions", async (req, res) => {
   const model = req.body?.model || "deepseek-v3";
   const isStreaming = req.body?.stream === true;
 
+  // Force Puppeteer mode — browser page.solveChatMessage() handles PoW automatically
+  logInfo("[Proxy] Маршрутизация через браузер (PoW авто-решение)");
+
   if (!hasValidSession()) {
     return res.status(401).json({ error: "Сессия не найдена. Запустите авторизацию." });
   }
@@ -108,16 +111,23 @@ app.post("/api/v1/chat/completions", async (req, res) => {
 
   const startTime = Date.now();
 
+  // Init browser page on first request
+  await initBrowserPage();
+
   try {
+    // Send message through authenticated browser context (bypasses PoW validation)
+    const apiResult = await sendViaBrowser(messages, model);
+
+    if (!apiResult?.success) {
+      logWarn(`DeepSeek ${model}: Browser API returned error — ${apiResult.error}`);
+      return res.status(502).json({ error: apiResult.error });
+    }
+
+    const fullContent = apiResult.data.content;
+
     if (!isStreaming) {
-      // Non-streaming: wait for full response, then return standard OpenAI format
-      let capturedContent = "";
-
-      await sendMessage([{ role: "user", content: userMsg.content }], model, (chunk) => {
-        capturedContent += chunk;
-      });
-
-      const completionTokens = estimateTokens(capturedContent);
+      // Non-streaming response
+      const completionTokens = estimateTokens(fullContent);
 
       return res.json({
         id: `chatcmpl-${Date.now()}`,
@@ -127,7 +137,7 @@ app.post("/api/v1/chat/completions", async (req, res) => {
         choices: [
           {
             index: 0,
-            message: { role: "assistant", content: capturedContent },
+            message: { role: "assistant", content: fullContent },
             finish_reason: "stop",
           },
         ],
@@ -158,10 +168,10 @@ app.post("/api/v1/chat/completions", async (req, res) => {
     });
     res.write(roleChunk);
 
-    let fullContent = "";
-
-    await sendMessage([{ role: "user", content: userMsg.content }], model, (chunk) => {
-      fullContent += chunk;
+    // Send content chunks (simulated streaming from full response)
+    const chunkSize = 4; // chars per SSE event
+    for (let i = 0; i < fullContent.length; i += chunkSize) {
+      const chunk = fullContent.slice(i, i + chunkSize);
       const dataChunk = buildSSE({
         id: completionId,
         object: "chat.completion.chunk",
@@ -171,7 +181,7 @@ app.post("/api/v1/chat/completions", async (req, res) => {
       });
 
       if (!res.writableEnded) res.write(dataChunk);
-    });
+    }
 
     // Final [DONE] chunk
     const doneChunk = buildSSE({
@@ -287,8 +297,14 @@ function safeShutdown() {
   process.exit(0);
 }
 
-process.on("SIGINT", safeShutdown);
-process.on("SIGTERM", safeShutdown);
+async function gracefulShutdown() {
+  logInfo("Закрытие прокси...");
+  await shutdownBrowser();
+  process.exit(0);
+}
+
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
 process.on("uncaughtException", (err) => {
   logError("Необработанное исключение", err);
   process.exit(1);

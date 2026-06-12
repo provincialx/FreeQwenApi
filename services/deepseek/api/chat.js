@@ -42,7 +42,18 @@ export async function sendMessage(
     };
   }
 
-  const content = messages.length > 0 ? messages[messages.length - 1].content : "";
+  const lastMsg = messages[messages.length - 1];
+  let content = lastMsg?.content ?? "";
+  // DeepSeek prompt must be a plain string. Handle array content (e.g., tool_call responses)
+  if (Array.isArray(content)) {
+    content = content
+      .map((p) => {
+        if (typeof p === "string") return p;
+        if (typeof p === "object" && p.text) return p.text;
+        return JSON.stringify(p);
+      })
+      .join("\n");
+  }
 
   // Build cookie string from array of objects
   const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
@@ -165,7 +176,11 @@ async function executeApiRequest(content, model, cookieStr, authData = {}, onChu
     // === Solve Proof-of-Work (PoW) if we have the required data ===
     let powResponseHeader = undefined;
 
-    if (authData.wasmUrl && authData.hif_dliq && authData.hif_leim) {
+    // New DeepSeek frontend may work with just token+cookie, without PoW.
+    // Try PoW only if we have ALL required data. Fall back gracefully otherwise.
+    const hasPowData = authData.wasmUrl && authData.hif_dliq && authData.hif_leim;
+
+    if (hasPowData) {
       logInfo("[PoW] Запрос челленджа для решения...");
       try {
         // Create PoW challenge URL dynamically based on current API base URL
@@ -255,6 +270,7 @@ async function executeApiRequest(content, model, cookieStr, authData = {}, onChu
     }
 
     // === Build request body according to DeepSeek Web API v0 spec ===
+    // content is guaranteed to be a string by sendMessage()
     const requestBody = JSON.stringify({
       model_type: cfg.model_type,
       prompt: content,
@@ -263,6 +279,7 @@ async function executeApiRequest(content, model, cookieStr, authData = {}, onChu
       ref_file_ids: [],
       action: null,
       preempt: false,
+      chat_session_id: crypto.randomUUID(), // Required by DeepSeek API v0
     });
 
     const controller = new AbortController();
@@ -279,17 +296,42 @@ async function executeApiRequest(content, model, cookieStr, authData = {}, onChu
       // Full browser imitation headers (required for DeepSeek Web validation)
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      // Browser fingerprint headers that DeepSeek validates
+      "Accept-Language": "en-US,en;q=0.9",
+      "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="131", "Google Chrome";v="131"',
+      "Sec-Ch-Ua-Mobile": "?0",
+      "Sec-Ch-Ua-Platform": '"Windows"',
+      // DeepSeek internal versioning headers
       "x-client-platform": "web",
-      "x-client-version": authData.x_client_version || "2.0.0",
+      "x-client-version":
+        typeof authData.x_client_version === "string" ? authData.x_client_version : "1.0.0",
     };
 
-    // Add Authorization token if available (required for API access)
-    if (authData.token) {
+    // DeepSeek Web API v0 requires BOTH:
+    // 1. Cookie-based auth (aws-waf-token + ds_session_id) in Cookie header
+    // 2. userToken as Bearer in Authorization header
+    if (authData.bearerToken && typeof authData.bearerToken === "string") {
+      headers["Authorization"] = `Bearer ${authData.bearerToken}`;
+      logInfo(`DeepSeek: используем Bearer токен (${authData.bearerToken.slice(0, 12)}...)`);
+    } else if (authData.token && typeof authData.token === "string") {
+      // Fallback: use aws-waf-token as Bearer
       headers["Authorization"] = `Bearer ${authData.token}`;
-      logInfo(`DeepSeek: используем токен авторизации (${authData.token.slice(0, 8)}...)`);
-    } else {
-      logWarn("DeepSeek: токен авторизации не найден! Запрос может быть отклонен.");
+      logInfo(`DeepSeek: используем cookie-токен как Bearer (${authData.token.slice(0, 12)}...)`);
     }
+
+    // Add version headers from auth data — must be strings!
+    const clientVersion = authData.x_client_version;
+    if (clientVersion && typeof clientVersion === "string") {
+      headers["x-client-version"] = clientVersion;
+    }
+
+    const cookieCount = (cookieStr.match(/=/g) || []).length;
+    logInfo(
+      `DeepSeek: хедеры — Cookie keys: ${cookieCount}, Auth: ${!!headers.Authorization}, Version: ${headers["x-client-version"]}`
+    );
+
+    // Note: DeepSeek frontend uses cookie-based auth (aws-waf-token + ds_session_id)
+    // Cookie string is passed in headers.Cookie above.
 
     // Add custom headers if available (hif_dliq, hif_leim)
     if (authData.hif_dliq) headers["x-hif-dliq"] = authData.hif_dliq;
@@ -422,15 +464,51 @@ async function parseSSEStream(stream, model, onChunk) {
 async function handleNonSseResponse(response, onChunk) {
   const text = await response.text();
 
+  // DeepSeek JSON responses have format:
+  // { "code": 0, "data": { "delta": "text" }, ... }
+  logInfo(`[Debug/JSON] Raw response (${text.length} chars): ${text.slice(0, 300)}`);
+
+  let content = text;
+
+  try {
+    const json = JSON.parse(text);
+    logInfo(`[Debug/JSON] Parsed keys: ${Object.keys(json).join(", ")}, code=${json.code}`);
+
+    // Try multiple common DeepSeek response formats
+    if (json?.data?.delta && typeof json.data.delta === "string") {
+      content = json.data.delta;
+    } else if (json?.message && typeof json.message === "string") {
+      content = json.message;
+    } else if (Array.isArray(json)) {
+      // SSE-like JSON array
+      content = json
+        .map((item) => {
+          try {
+            const parsed =
+              typeof item === "string" ? JSON.parse(item.replace(/^data: /, "")) : item;
+            return parsed?.v || parsed?.delta || parsed?.content || "";
+          } catch {
+            return "";
+          }
+        })
+        .filter(Boolean)
+        .join("");
+    }
+
+    logInfo(`[Debug/JSON] Extracted content (${content.length}): ${content.slice(0, 150)}`);
+  } catch {
+    // Not JSON, use raw text
+  }
+
   if (onChunk && typeof onChunk === "function") {
     try {
-      onChunk(text);
+      onChunk(content);
     } catch {}
   }
 
   return {
     success: true,
-    data: { content: text },
+    data: { content },
   };
 }
 

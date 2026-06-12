@@ -4,7 +4,7 @@ import { fileURLToPath } from "url";
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
-import { logInfo, logError, logWarn } from "../../../shared/logger/index.js";
+import { logInfo, logError, logWarn, logDebug } from "../../../shared/logger/index.js";
 import { CHAT_PAGE_URL, PAGE_TIMEOUT, VIEWPORT_WIDTH, VIEWPORT_HEIGHT } from "../config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -46,9 +46,13 @@ export async function initAuthBrowser() {
     logInfo("Запуск браузера для авторизации DeepSeek...");
 
     const browser = await puppeteer.launch({
-      headless: false, // Must be visible for login + CAPTCHA solving
-      args: ["--no-sandbox"],
-      defaultViewport: null,
+      headless: false,
+      args: [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--lang=en-US,en",
+        "--window-size=" + VIEWPORT_WIDTH + "," + VIEWPORT_HEIGHT,
+      ],
     });
 
     globalBrowser = browser;
@@ -77,7 +81,192 @@ export async function shutdownAuthBrowser() {
   }
 }
 
-async function extractSessionToAccount(page) {
+// === PoW Data Capture (hif_dliq, hif_leim, wasmUrl) ===
+// DeepSeek adds custom headers via JS fetch. We need TWO capture methods:
+// 1. JS-level interceptor: override fetch/XHR before page loads
+// 2. CDP network capture: intercept actual wire-level requests as fallback
+
+// CDP-based network capture — captures ALL requests including Service Worker ones
+// We use Network.extraInfoReceived which fires AFTER JS adds custom headers (hif_*)
+let cdpSession = null;
+let networkEvents = [];
+let wasmResourceUrls = []; // Captured WASM resource URLs from CDP
+
+// === Aggressive JS-level intercept that works around bundler closures ===
+async function injectJSCapture(page) {
+  // Phase 1: Initialize the capture object before ANY scripts run
+  await page.evaluateOnNewDocument(`(() => { window.__capturedHeaders__ = {}; })()`);
+}
+
+// Phase 2: After page loads, install interceptors on the live prototypes.
+// This catches bundled fetch/XHR that captured `window.fetch` at module init time.
+async function injectPostLoadCapture(page) {
+  try {
+    await page.evaluate(`(() => {
+      // --- Aggressive XHR capture via object property override ---
+      const XHRProto = XMLHttpRequest.prototype;
+
+      // Save originals before touching anything
+      if (!XHRProto.__origSend) XHRProto.__origSend = XHRProto.send;
+      if (!XHRProto.__origOpen) XHRProto.__origOpen = XHRProto.open;
+
+      XHRProto.open = function(method, url) {
+        this._captureUrl = url;
+        this._captureHeaders = {};
+        return XHRProto.__origOpen.call(this, method, url);
+      };
+
+      // Intercept setRequestHeader by wrapping it at the PropertyDescriptor level
+      const _origSetRH = Object.getOwnPropertyDescriptor(XHRProto, 'setRequestHeader');
+      if (_origSetRH) {
+        Object.defineProperty(XHRProto, 'setRequestHeader', {
+          value: function(name, val) {
+            if (!this._captureHeaders) this._captureHeaders = {};
+            this._captureHeaders[name] = val;
+            return _origSetRH.value.call(this, name, val);
+          },
+          writable: true,
+          configurable: true
+        });
+      }
+
+      const origSend = XHRProto.__origSend || XHRProto.send;
+      Object.defineProperty(XHRProto, 'send', {
+        value: function(body) {
+          if (this._captureUrl && this._captureUrl.includes('deepseek.com') && this._captureHeaders) {
+            window.__capturedHeaders__ = {...window.__capturedHeaders__, ...this._captureHeaders};
+            // Log captured XHR headers
+            console.log('[XHR_CAPTURE]', this._captureUrl.slice(0, 60), Object.keys(this._captureHeaders));
+          }
+          return origSend.call(this, body);
+        },
+        writable: true,
+        configurable: true
+      });
+
+      // --- Aggressive fetch capture via descriptor override ---
+      if (!window.__real_fetch__) {
+        window.__real_fetch__ = fetch.bind(window);
+      }
+
+      Object.defineProperty(window, 'fetch', {
+        value: async function(url, options) {
+          const u = (url && url.toString()) || '';
+          if (u.includes('deepseek.com') && options && options.headers) {
+            let hObj = {};
+            try { hObj = Object.fromEntries(options.headers.entries()); }
+            catch(e) { hObj = {...options.headers}; }
+
+            window.__capturedHeaders__ = {...window.__capturedHeaders__, ...hObj};
+            // Log fetch headers for debugging
+            console.log('[FETCH_CAPTURE]', u.slice(0, 60), Object.keys(hObj));
+          }
+          return window.__real_fetch__(url, options);
+        },
+        configurable: true,
+        writable: true
+      });
+    })()`);
+
+    logInfo("[Auth] Post-load interceptors installed (XHR + fetch descriptors)");
+  } catch (e) {
+    logWarn("[Auth] Post-load interceptor failed:", e.message);
+  }
+}
+
+// Map to correlate requests across CDP events
+const _requestMap = new Map();
+
+async function enableNetworkCapture(page) {
+  try {
+    cdpSession = await page.createCDPSession();
+    await cdpSession.send("Network.enable", { maxPostDataSize: 65536 });
+
+    networkEvents = [];
+    wasmResourceUrls = [];
+    _requestMap.clear();
+
+    // Track requests — captures all deepseek.com request headers
+    cdpSession.on("Network.requestWillBeSent", (params) => {
+      const url = params.request?.url || "";
+      if (/\.wasm/i.test(url)) {
+        wasmResourceUrls.push(url);
+        logInfo(`[Auth] CDP: Found WASM resource: ${url.slice(0, 120)}`);
+      }
+
+      const reqData = {
+        url,
+        method: params.request?.method || "",
+        headers: params.request?.headers || {},
+        timestamp: Date.now(),
+      };
+
+      _requestMap.set(params.requestId, reqData);
+
+      // Push to networkEvents for API calls (where hif_* likely present)
+      if (url.includes("deepseek.com") && !/\.(js|css|png|svg|woff)/.test(url)) {
+        networkEvents.push(reqData);
+      }
+    });
+
+    // Capture final headers (JS-modified). Use requestSent event.
+    cdpSession.on("Network.dataSent", (params) => {
+      const reqInfo = _requestMap.get(params.requestId);
+      if (!reqInfo) return;
+      // dataSent has less useful info, but logs POST body sends
+      logDebug(`[Auth] CDP dataSent: ${reqInfo.method} ${reqInfo.url.slice(0, 40)}`);
+    });
+
+    // Capture response status for API calls (debug only)
+    cdpSession.on("Network.responseReceived", (params) => {
+      const reqInfo = _requestMap.get(params.requestId);
+      if (!reqInfo) return;
+      if (/\/api\//.test(reqInfo.url)) {
+        logDebug(`[Auth] CDP response: ${params.response?.status} ${reqInfo.url.slice(0, 60)}`);
+      }
+    });
+
+    logInfo("[Auth] CDP network observer enabled (non-blocking)");
+  } catch (e) {
+    logWarn("[Auth] Network capture failed:", e.message);
+  }
+}
+
+// Extract PoW data from CDP-requestWillBeSent events (non-blocking observer format)
+function extractPoWFromNetworkEvents() {
+  let hif_dliq = "";
+  let hif_leim = "";
+  let wasmUrl = "";
+
+  // Find WASM URL from captured resources
+  if (wasmResourceUrls.length > 0) {
+    wasmUrl = wasmResourceUrls[wasmResourceUrls.length - 1];
+  }
+
+  // Extract hif headers from CDP events — requestWillBeSent sees headers after JS adds them
+  for (const event of networkEvents) {
+    const hdrs = event.headers || {};
+    for (const [k, v] of Object.entries(hdrs)) {
+      if (k.toLowerCase() === "x-hif-dliq" && !hif_dliq) hif_dliq = String(v);
+      if (k.toLowerCase() === "x-hif-leim" && !hif_leim) hif_leim = String(v);
+    }
+  }
+
+  return { hif_dliq, hif_leim, wasmUrl };
+}
+
+function extractHifFromCaptured(capturedHeaders = {}) {
+  let hif_dliq = "";
+  let hif_leim = "";
+
+  for (const [k, v] of Object.entries(capturedHeaders)) {
+    if (k.toLowerCase() === "x-hif-dliq") hif_dliq = String(v);
+    if (k.toLowerCase() === "x-hif-leim") hif_leim = String(v);
+  }
+
+  return { hif_dliq, hif_leim };
+}
+async function extractSessionToAccount(page, networkData = {}) {
   try {
     const cookies = await page.cookies(CHAT_PAGE_URL);
     if (!cookies.length) return false;
@@ -106,15 +295,23 @@ async function extractSessionToAccount(page) {
       try {
         for (let i = 0; i < sessionStorage.length; i++) {
           const key = sessionStorage.key(i);
-          result.ss[key] = sessionStorage.getItem(key);
+          let val = sessionStorage.getItem(key);
+          // Same JSON parsing as localStorage
+          if (val && (val.startsWith("{") || val.startsWith("["))) {
+            try {
+              result.ss[key] = JSON.parse(val);
+            } catch {
+              result.ss[key] = val;
+            }
+          } else {
+            result.ss[key] = val;
+          }
         }
       } catch {}
 
       return result;
     });
-
-    // Deep recursive search across all nested objects/arrays for a target key
-    function deepSearch(rootObj, targetKeys) {
+    function deepSearch(rootObj, targetKeys, storageName = "storage", exactOnly = false) {
       let found = null;
 
       function iterate(current, path = "") {
@@ -128,11 +325,35 @@ async function extractSessionToAccount(page) {
 
         for (const key of Object.keys(current)) {
           const val = current[key];
+
+          // Check direct match
           if (targetKeys.includes(key) && val !== undefined && val !== null) {
             found = val;
-            logInfo(`[DeepSearch] Found '${key}' at: ${path ? path + "." : ""}${key}`);
+            logInfo(
+              `[DeepSearch/${storageName}] Found '${key}' at: ${path ? path + "." : ""}${key}`
+            );
             return;
           }
+
+          // Partial match only when NOT exactOnly — avoids false positives like aws_waf_token_challenge_attempts ~token
+          if (!exactOnly) {
+            const lowerKey = key.toLowerCase();
+            for (const tk of targetKeys) {
+              if (
+                lowerKey !== tk.toLowerCase() && // skip if already matched directly
+                lowerKey.includes(tk.toLowerCase()) &&
+                val !== undefined &&
+                val !== null
+              ) {
+                found = val;
+                logInfo(
+                  `[DeepSearch/${storageName}] Found '${key}' (~${tk}) at: ${path ? path + "." : ""}${key}`
+                );
+                return;
+              }
+            }
+          }
+
           // Recurse deeper
           iterate(val, path ? `${path}.${key}` : key);
         }
@@ -142,41 +363,133 @@ async function extractSessionToAccount(page) {
       return found;
     }
 
-    // Extract important auth data from storage using robust search
-    const lsData = rawData.ls;
+    // Search both localStorage AND sessionStorage — DeepSeek may store auth data in either
+    function searchBoth(targetKeys, exactOnly = false) {
+      const lsResult = deepSearch(rawData.ls, targetKeys, "ls", exactOnly);
+      if (lsResult) return lsResult;
 
+      const ssResult = deepSearch(rawData.ss, targetKeys, "ss", exactOnly);
+      if (ssResult) return ssResult;
+
+      return null;
+    }
+
+    // Extract important auth data from storage using robust search
     let token = "";
     let wasmUrl = "";
     let hif_dliq = "";
     let hif_leim = "";
     let x_client_version = "2.0.0"; // default fallback
 
-    // Deep search for keys in nested objects
-    token =
-      lsData.token ||
-      lsData.authorization ||
-      lsData.auth_token ||
-      lsData["authorization"] ||
-      deepSearch(lsData, ["token", "auth_token", "Authorization"]) ||
-      "";
-    wasmUrl =
-      lsData.wasmUrl ||
-      lsData.wasm_url ||
-      lsData["wasm-url"] ||
-      deepSearch(lsData, ["wasmUrl", "wasm_url", "_c2c_wasm_url", "wasmURL", "WASM_URL"]) ||
-      "";
-    hif_dliq = lsData.hif_dliq || deepSearch(lsData, ["hif_dliq", "HIF_DLIQ"]) || "";
-    hif_leim = lsData.hif_leim || deepSearch(lsData, ["hif_leim", "HIF_LEIM"]) || "";
-    x_client_version =
-      lsData["x-client-version"] ||
-      deepSearch(lsData, ["client_version", "version", "VERSION", "_c2c_version"]) ||
-      x_client_version;
+    const cookieObjMap = {};
+    for (const c of cookies) {
+      cookieObjMap[c.name] = c.value;
+    }
 
-    // Log all storage keys to help debugging if nothing is found
+    // --- Extract auth tokens from cookies + localStorage (DeepSeek v2+) ---
+    // DeepSeek uses TWO different tokens:
+    // 1. aws-waf-token (cookie) — session cookie for WAF
+    // 2. userToken (localStorage) — Bearer token for Authorization header
+
+    let bearerToken = "";
+
+    if (!token && cookieObjMap["aws-waf-token"]) {
+      token = cookieObjMap["aws-waf-token"];
+      logInfo("[Auth] Cookie token extracted from aws-waf-token");
+    }
+
+    // Extract userToken for Authorization Bearer header (from localStorage)
+    const lsUserToken = rawData.ls?.userToken;
+    if (lsUserToken && typeof lsUserToken === "object" && lsUserToken.value) {
+      bearerToken = lsUserToken.value;
+      logInfo(`[Auth] userToken extracted from localStorage (${bearerToken.slice(0, 12)}...)`);
+    } else if (!token) {
+      const lsData = rawData.ls;
+      token = lsData.token || lsData.authorization || lsData.auth_token || "";
+      bearerToken = searchBoth(["userToken", "access_token"], true) || "";
+      // Handle object-wrapped values
+      if (bearerToken && typeof bearerToken === "object") {
+        bearerToken = bearerToken.value || "";
+      }
+    }
+
+    // --- Extract from Network capture (from intercepted headers) ---
+    if (!wasmUrl && networkData.wasmUrl) {
+      wasmUrl = networkData.wasmUrl;
+      logInfo("[Auth] wasmUrl from network/performance: OK");
+    }
+
+    if (!hif_dliq && networkData.hif_dliq) {
+      hif_dliq = networkData.hif_dliq;
+      logInfo("[Auth] hif_dliq from network capture: OK");
+    } else {
+      // Fallback: search localStorage
+      const lsData = rawData.ls;
+      hif_dliq =
+        lsData.hif_dliq || cookieObjMap["hif_dliq"] || searchBoth(["hif_dliq", "HIF_DLIQ"]) || "";
+    }
+    logInfo(`[Auth] hif_dliq found: ${!!hif_dliq}`);
+
+    if (!hif_leim && networkData.hif_leim) {
+      hif_leim = networkData.hif_leim;
+      logInfo("[Auth] hif_leim from network capture: OK");
+    } else {
+      // Fallback: search localStorage
+      const lsData = rawData.ls;
+      hif_leim =
+        lsData.hif_leim || cookieObjMap["hif_leim"] || searchBoth(["hif_leim", "HIF_LEIM"]) || "";
+    }
+    logInfo(`[Auth] hif_leim found: ${!!hif_leim}`);
+
+    // --- wasmUrl fallback from storage ---
+    if (!wasmUrl) {
+      wasmUrl = searchBoth(["wasmUrl", "wasm_url"]) || "";
+      logInfo(`[Auth] wasmUrl from storage: ${!!wasmUrl}`);
+    }
+
+    const foundClientVersion =
+      rawData.ls["x-client-version"] ||
+      searchBoth(["client_version", "version", "VERSION", "_c2c_version"]);
+
+    // Ensure x_client_version is a string — it can be stored as {value: 1, __version: "0"} which breaks headers
+    if (foundClientVersion) {
+      x_client_version =
+        typeof foundClientVersion === "string"
+          ? foundClientVersion
+          : String(foundClientVersion.value || foundClientVersion);
+    }
+
+    // Deep DEBUG: show first-level values of config keys when PoW missing
+    if (!wasmUrl || !hif_dliq || !hif_leim) {
+      const lsData = rawData.ls;
+
+      // Check APMPLUS cache — likely server config with wasm info
+      if (lsData["APMPLUS_cache__server_config_675113"])
+        logInfo(
+          `[Debug/ServerConfig] ${JSON.stringify(lsData["APMPLUS_cache__server_config_675113"]).slice(0, 400)}`
+        );
+
+      // Check tea tokens — might contain auth data
+      if (lsData["__tea_cache_tokens_20006317"])
+        logInfo(
+          `[Debug/TeaTokens] ${JSON.stringify(lsData["__tea_cache_tokens_20006317"]).slice(0, 400)}`
+        );
+
+      // Check ds_remote_feature_store — might have wasm hints
+      if (lsData["__ds_remote_feature_store"])
+        logInfo(
+          `[Debug/FeatureStore] ${JSON.stringify(lsData["__ds_remote_feature_store"]).slice(0, 400)}`
+        );
+
+      // Show ALL cookie names + truncated values — PoW data may be in cookies
+      const cookieNames = (await page.cookies()).map((c) => c.name);
+      logInfo(`[Debug/Cookies] Names: ${cookieNames.join(", ")}`);
+    }
+
     const allKeys = Object.keys(rawData.ls).concat(Object.keys(rawData.ss));
     logInfo(`DeepSeek Storage Keys: ${allKeys.join(", ")}`);
 
-    const authData = { token, wasmUrl, hif_dliq, hif_leim, x_client_version };
+    const authData = { token, bearerToken, wasmUrl, hif_dliq, hif_leim, x_client_version };
 
     // Log status (without sensitive full values)
     if (!wasmUrl || !hif_dliq || !hif_leim) {
@@ -231,24 +544,114 @@ export async function addAccountInteractive() {
     const page = await globalBrowser.newPage();
     await page.setViewport({ width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT });
 
-    await page.goto(CHAT_PAGE_URL, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT });
+    // Phase 1: Init capture object (runs before any scripts)
+    await injectJSCapture(page);
+
+    // CDP network capture — captures WASM resources + request metadata
+    await enableNetworkCapture(page);
+
+    await page.goto(CHAT_PAGE_URL, { waitUntil: "networkidle2", timeout: 30000 });
 
     console.log("\n------------------------------------------------------");
     console.log("               ОЖИДАНИЕ ВХОДА В DEEPSEEK");
     console.log("------------------------------------------------------");
     console.log("1. Нажмите Login в правом верхнем углу.");
     console.log("2. Войдите через GitHub / Google в браузере.");
-    console.log("3. После входа нажмите ENTER здесь.");
+    console.log("3. Отправьте короткое сообщение (напр. 'ok') — это обязательно!");
+    console.log("4. После отправки сообщения нажмите ENTER здесь.");
     console.log("------------------------------------------------------\n");
 
     const { prompt } = await import("../../../shared/utils/prompt.js");
     await prompt("Нажмите ENTER после успешной авторизации...");
     logInfo("Вход подтверждён, извлекаю сессию...");
 
-    // Wait for page to stabilize after login redirect
-    await new Promise((r) => setTimeout(r, 3000));
+    // Wait for page to settle after sending message
+    await new Promise((r) => setTimeout(r, 5000));
 
-    const extracted = await extractSessionToAccount(page);
+    // === Collect PoW data from ALL sources and merge ===
+
+    // Source 1: JS-level interceptor (window.__capturedHeaders__)
+    const jsAuthData = await page.evaluate(() => {
+      return {
+        fetchHeaders: window.__capturedHeaders__ || {},
+        xhrHeaders: window.__lastXHRHeaders__ || {},
+      };
+    });
+
+    // Log JS capture results — dump ALL keys for debugging
+    const allJsHeaders = { ...jsAuthData.fetchHeaders, ...jsAuthData.xhrHeaders };
+    logInfo(`[Auth] JS capture: headers_keys=[${Object.keys(allJsHeaders).join(", ")}]`);
+
+    // Debug: show fetch-specific keys (they usually have PoW data)
+    const fetchKeys = Object.keys(jsAuthData.fetchHeaders || {});
+    if (fetchKeys.length > 0) {
+      logInfo(`[Debug/JSFetch] ${JSON.stringify(fetchKeys).slice(0, 200)}`);
+      for (const k of fetchKeys) {
+        const v = jsAuthData.fetchHeaders[k];
+        if (/hif|pow/i.test(k)) {
+          logInfo(`[Debug/JSFetch] ${k} = ${String(v).slice(0, 80)}...`);
+        }
+      }
+    }
+
+    // Extract hif from JS source (prefer fetch over XHR if both have data)
+    const jsPreferred =
+      Object.keys(jsAuthData.fetchHeaders).length > 1
+        ? jsAuthData.fetchHeaders
+        : jsAuthData.xhrHeaders;
+    const jsHif = extractHifFromCaptured(jsPreferred);
+
+    // Source 2: CDP network capture (wire-level + WASM resources)
+
+    // Debug dump: show ALL header keys from ALL intercepted events
+    const cdpAllKeys = new Set();
+    for (const ev of networkEvents) {
+      for (const k of Object.keys(ev.headers || {})) {
+        cdpAllKeys.add(k.toLowerCase());
+      }
+    }
+    logInfo(`[Auth] CDP all header keys (${cdpAllKeys.size}): ${[...cdpAllKeys].join(", ")}`);
+
+    // Debug: dump first 5 intercepted event details
+    for (let i = 0; i < Math.min(5, networkEvents.length); i++) {
+      const ev = networkEvents[i];
+      logInfo(
+        `[Debug/CDP#${i}] ${ev.method} ${ev.url.slice(0, 60)} | keys=[${Object.keys(
+          ev.headers || {}
+        )
+          .slice(0, 15)
+          .join(", ")}]`
+      );
+    }
+
+    const cdpPoW = extractPoWFromNetworkEvents();
+    logInfo(
+      `[Auth] CDP capture: wasm=${!!cdpPoW.wasmUrl}, hif_dliq=${!!cdpPoW.hif_dliq}, hif_leim=${!!cdpPoW.hif_leim}, events=${networkEvents.length}`
+    );
+
+    // Source 3: Fallback — performance.getEntriesByType for wasmUrl (last resort)
+    const fallbackWasm = await page.evaluate(() => {
+      return (
+        performance
+          .getEntriesByType("resource")
+          .map((r) => r.name)
+          .find((u) => /\.wasm/.test(u)) || ""
+      );
+    });
+
+    // === Merge: priority order for each field ===
+    const mergedPoW = {
+      hif_dliq: jsHif.hif_dliq || cdpPoW.hif_dliq || "",
+      hif_leim: jsHif.hif_leim || cdpPoW.hif_leim || "",
+      wasmUrl: cdpPoW.wasmUrl || fallbackWasm || "", // CDP wasm is more reliable
+    };
+
+    logInfo(
+      `[Auth] Merged PoW: wasm=${!!mergedPoW.wasmUrl}, hif_dliq=${!!mergedPoW.hif_dliq}, hif_leim=${!!mergedPoW.hif_leim}`
+    );
+
+    const extracted = await extractSessionToAccount(page, mergedPoW);
+
     if (!extracted) {
       logWarn("Не удалось извлечь cookie. Возможно, вход не прошёл.");
       return null;
