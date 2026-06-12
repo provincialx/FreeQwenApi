@@ -78,7 +78,7 @@ export function solvePoW(challenge) {
     salt: challenge.salt,
     answer: nonce,
     signature: challenge.signature || "",
-    target_path: "https://chat.deepseek.com/api/v0/chat/completion",
+    target_path: "/api/v0/chat/completion",
   });
 
   // Base64 encode (safe for ASCII JSON)

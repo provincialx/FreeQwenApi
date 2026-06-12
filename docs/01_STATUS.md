@@ -1,10 +1,12 @@
 # FreeQwenApi — Status (2026-06-12)
 
-## Health: YELLOW — DeepSeek Cookie restore + PoW fixes (2026-06-12)
+## Health: GREEN — DeepSeek direct API mode (2026-06-12)
 
-DeepSeek: исправлено восстановление session cookie `ds_session_id`. Ранняя проверка auth
-(`checkAuthViaApi`) теперь не блокирует запрос — PoW решается лениво в `sendViaBrowser`.
-Добавлен retry поиска WASM URL с триггером prefetch через challenge. Улучшен anti-detection.
+DeepSeek: полностью убран Puppeteer из API вызовов. Теперь используются прямые `fetch()`
+из Node.js с сохранёнными credentials (cookie + Bearer token + WASM solver).
+Браузер используется только для одноразовой авторизации (auth.js). PoW решается через
+WASM модуль (sha3_wasm_bg.wasm) с хардкодным fallback URL. Больше нет зависаний
+из-за WAF/CAPTCHA — API запросы не проходят через браузер.
 Qwen: без изменений.
 
 ### Architecture S61+: Multi-Provider Separation

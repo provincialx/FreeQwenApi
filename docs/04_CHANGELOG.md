@@ -198,3 +198,43 @@ CDP перехват не успевал поймать его при иници
 - resourceWasm method 1b: добавлена проверка \.wasm (были false positive на api.js)
 - resourceWasm method 6: фильтрация кандидатов по \.wasm
 - mergedPoW приоритет: CDP (точный \.wasm фильтр) выше resourceWasm
+
+### DeepSeekHashV1 + WASM solver fix (2026-06-12)
+
+**Проблема:** DeepSeek сменил алгоритм PoW с `PoW_SHA3` на `DeepSeekHashV1`.
+Pure JS solver (powSolver.js, js-sha3) уходил в бесконечный цикл — SHA3-256
+не может дать 4096+ ведущих нулевых бит при макс 256 битах хеша.
+
+**Изменения:**
+
+**services/deepseek/browser/proxyPage.js:**
+- PoW решение теперь через WASM (загрузка sha3_wasm_bg.wasm, wasm_solve())
+  для алгоритма DeepSeekHashV1
+- Pure JS solver (solvePoW) оставлен как fallback только для PoW_SHA3
+- Challenge debug-лог исправлен: d.url → d.target_path
+- Приоритет targetPaths: относительный путь первым (/api/v0/chat/completion)
+
+**services/deepseek/utils/powSolver.js:**
+- target_path изменён с полного URL на относительный (/api/v0/chat/completion)
+  для консистентности с остальным кодом
+
+**services/deepseek/api/chat.js:**
+- Без изменений в логике (уже использует WASM), только убран лишний scene
+
+### Browser-free API mode (2026-06-12)
+
+**Проблема:** AWS WAF блокировал Puppeteer (CAPTCHA), WASM модуль не загружался,
+PoW не решался. Весь API-цикл зависал на `page.evaluate()`.
+
+**Решение:** Полный отказ от Puppeteer в API-вызовах. Браузер остаётся только
+для одноразовой авторизации (auth.js).
+
+**services/deepseek/browser/proxyPage.js:**
+- Полностью переписан. Удалены: puppeteer-extra, stealth-plugin, CDP,
+  restoreLocalStorage, checkAuthViaApi, setupExecutionContext, browser/page переменные
+- API вызовы: прямые `fetch()` из Node.js с cookie строкой в заголовке
+- PoW: WASM загружается через Node.js WebAssembly, решается в памяти
+- WASM URL fallback: хардкодный `DEFAULT_WASM_URL` на случай если auth не нашёл
+- session/create: через Node.js fetch (без page.evaluate)
+- SSE парсинг: вынесен в отдельную функцию, без Promise.race
+- initBrowserPage: только загрузка credentials из файла, без браузера
