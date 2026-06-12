@@ -75,10 +75,8 @@ export async function createPage(context) {
 // fast sync check
 export const EVALUATE_HEALTH_TIMEOUT = Number(process.env.EVALUATE_HEALTH_TIMEOUT) || 5_000;
 // slow async API calls can take minutes — give plenty of room (default: REQUEST_TIMEOUT * 2)
-const longTimeout = Math.max(
-  Number(process.env.REQUEST_TIMEOUT_MINUTES) * 60_000 + 30_000,
-  180_000
-);
+const REQ_TIMEOUT_MIN = Number(process.env.REQUEST_TIMEOUT_MINUTES) || 5; // default 5 min
+const longTimeout = Math.max(REQ_TIMEOUT_MIN * 60_000 + 30_000, 180_000);
 
 export async function evaluateWithTimeout(page, fn, timeoutMs = EVALUATE_HEALTH_TIMEOUT) {
   return Promise.race([
@@ -217,7 +215,7 @@ const pagePool = {
         // Bypass CSP — Qwen Studio blocks XMLHttpRequest/fetch via Content-Security-Policy headers.
         // Without this, all XHR in evaluate() throws "XHR network error" even with valid auth.
         try {
-          await newPage.setBypassCSP("all");
+          await newPage.setBypassCSP(true);
         } catch {
           /* ignore if page already closed */
         }

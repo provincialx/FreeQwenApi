@@ -82,10 +82,40 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
       "Upgrade-Insecure-Requests": "1",
     });
 
+    // Bypass CSP on main page — XHR inside evaluate() blocked by Qwen Studio CSP.
+    // Pool pages also get this in pagePool.getPage(), but main context must have it too.
+    try {
+      await page.setBypassCSP(true);
+    } catch {
+      /* CSP bypass is best-effort */
+    }
+
     await page.evaluateOnNewDocument(() => {
+      // ─── CRITICAL: Remove webdriver flag ────────────────────────────────────
+      // Aliyun WAF actively checks navigator.webdriver. Puppeteer's default is `true`.
+      // Override at the prototype level so it stays hidden even after page reloads.
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+
+      // ─── Chrome runtime objects ─────────────────────────────────────────────
+      // Real Chrome has `chrome` object with runtime, app, etc.
+      // WAF may check for these as a bot-detection signal.
+      if (!window.chrome) {
+        window.chrome = {
+          runtime: {},
+          app: {},
+          csi: () => {},
+          loadTimes: () => {},
+        };
+      }
+
+      // ─── Navigator overrides ────────────────────────────────────────────────
       Object.defineProperty(navigator, "platform", { get: () => "Win32" });
       Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
       Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+      // Set language to match Accept-Language header
+      Object.defineProperty(navigator, "language", { get: () => "en-US" });
+
       Object.defineProperty(navigator, "plugins", {
         get: () => [
           {
@@ -119,6 +149,19 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
           });
       }
 
+      // ─── Permission query override ──────────────────────────────────────────
+      // WAF can check permissions.query to detect headless Chrome.
+      const originalQuery = navigator.permissions?.query.bind(navigator.permissions);
+      if (navigator.permissions && originalQuery) {
+        navigator.permissions.query = (desc) => {
+          if (desc.name === "notifications" || desc.name === "clipboard-read") {
+            return Promise.resolve({ state: "prompt" });
+          }
+          return originalQuery(desc);
+        };
+      }
+
+      // ─── Event listener randomization (anti-fingerprinting) ─────────────────
       const originalAddEventListener = EventTarget.prototype.addEventListener;
       EventTarget.prototype.addEventListener = function (type, listener, options) {
         if (type === "mousemove" || type === "mousedown" || type === "mouseup") {
@@ -130,6 +173,7 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
         return originalAddEventListener.call(this, type, listener, options);
       };
 
+      // ─── Canvas fingerprint noise ───────────────────────────────────────────
       const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
       HTMLCanvasElement.prototype.toDataURL = function (type) {
         const context = this.getContext("2d");

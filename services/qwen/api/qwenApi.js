@@ -1050,37 +1050,10 @@ export async function sendMessage(
   let response = null;
   let page = null;
 
-  const cookieStr = getAuthToken();
-  logInfo(`🔍 [S59_CODE_V2] Two-path strategy active`);
-  let path1Failed = false;
-
-  // Skip Path 1 (Node-fetch) if WAF already blocked this IP — retrying is futile.
-  // WAF detects automation from Node.js User-Agent/IP and blocks all subsequent requests.
-  if (_wafActive) {
-    logWarn(`♻️ WAF активен — пропускаю Path 1 (Node-fetch), иду сразу в Path 2`);
-    response = { success: false, isCaptcha: true, error: "WAF skip (active)" };
-  } else {
-    logInfo(`🟢 Node-streaming (path 1): чат ${chatId}, parent: ${parentId || "null"}`);
-    try {
-      response = await executeApiRequestWithNodeStreaming(apiUrl, payload, onChunk, cookieStr);
-      logDebug(`[Path1] Result: success=${response.success}, isCaptcha=${response.isCaptcha}`);
-    } catch (err) {
-      logWarn(`Node-streaming failed: ${err.message}`);
-      path1Failed = true;
-    }
-  }
-
-  // ── Force browser fallback when Node fetch can't reach Qwen API ───────
-  // WAF blocks ALL subsequent Node-fetch from this IP/token. Retrying Node path is futile.
-  // Also covers "Токен авторизации" errors — browser can extract token from localStorage.
-  // NEW: "TypeError: terminated" and other network errors also trigger Path 2.
-  const path1NetworkError =
-    response &&
-    !response.success &&
-    response.error &&
-    /terminated|fetch failed|typeerror|networkerror|econnrefused|enotfound|etimedout/i.test(
-      String(response.error)
-    );
+  logInfo(
+    `🟡 Path 1 (Node-fetch) отключён для chat/completions — WAF требует браузерного контекста. Иду сразу в Path 2.`
+  );
+  response = { success: false, isCaptcha: true, error: "Path1 skipped (S62)" };
 
   // Log WAF body on first detection for debugging new protection patterns
   let wafDetected =
@@ -1095,19 +1068,13 @@ export async function sendMessage(
 
   const forceBrowserFallback =
     _wafActive ||
-    path1Failed ||
-    path1NetworkError ||
     (response && !response.success && response.isCaptcha) ||
     (response && !response.success && isCaptchaChallenge(response.errorBody));
 
   try {
     // ── Path 2: Browser fallback — forced when WAF blocks Node fetch ─────────
     if (forceBrowserFallback) {
-      const reason = path1Failed
-        ? "Path1 exception"
-        : response?.isCaptcha
-          ? "WAF challenge"
-          : "HTML response";
+      const reason = response?.isCaptcha ? "WAF challenge/S62 skip" : "HTML response";
       logWarn(`🟡 Browser fallback forced: ${reason} → executeApiRequest on main context`);
       try {
         // Use the main authenticated page directly.

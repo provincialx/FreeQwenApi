@@ -93,9 +93,18 @@ async function checkAuthViaApi(page) {
   try {
     // Check cookies on BOTH domains — DeepSeek sets aws-waf-token on .deepseek.com,
     // ds_session_id on chat.deepseek.com. After WAF refresh, new token may replace old.
+    // Puppeteer takes URL or no domain filter. Use chat subdomain and all-cookies to catch both domains.
     const cookiesChat = await page.cookies("https://chat.deepseek.com");
-    const cookiesRoot = await page.cookies("https://.deepseek.com");
-    const allCookies = [...cookiesChat, ...cookiesRoot];
+    let cookiesAll = [];
+    try {
+      cookiesAll = await page.cookies(); // Catch .deepseek.com root cookies
+    } catch {}
+    // Merge unique by name+domain path
+    const cookieMap = new Map();
+    for (const c of [...cookiesChat, ...cookiesAll]) {
+      cookieMap.set(`${c.name}@${c.domain}:${c.path}`, c);
+    }
+    const allCookies = [...cookieMap.values()];
 
     if (!allCookies.length) {
       logDebug(`[BrowserProxy] Нет cookie на странице`);
@@ -151,10 +160,13 @@ async function enableProxyNetworkCapture(page) {
     await cdpSession.send("Network.enable", { maxPostDataSize: 65536 });
     proxyWasmUrl = null;
 
-    // Track resource loading — find WASM files
+    // Track resource loading — find WASM files (exclude Cloudflare Turnstile)
+    const wasmFilter = /\.wasm/i;
+    const notCloudflare = (url) => !/cloudflare|turnstile/i.test(url);
+
     cdpSession.on("Network.requestWillBeSent", (params) => {
       const url = params.request?.url || "";
-      if (!proxyWasmUrl && /\.wasm/i.test(url)) {
+      if (!proxyWasmUrl && wasmFilter.test(url) && notCloudflare(url)) {
         proxyWasmUrl = url;
         logInfo(`[BrowserProxy] CDP: WASM resource найден — ${url.slice(0, 120)}`);
       }
@@ -163,7 +175,7 @@ async function enableProxyNetworkCapture(page) {
     // Capture response headers (may contain WAF challenge info)
     cdpSession.on("Network.responseReceived", (params) => {
       const url = params.response?.url || "";
-      if (/\.wasm/i.test(url) && !proxyWasmUrl) {
+      if (!proxyWasmUrl && wasmFilter.test(url) && notCloudflare(url)) {
         proxyWasmUrl = url;
         logInfo(`[BrowserProxy] CDP response: WASM resource найден — ${url.slice(0, 120)}`);
       }
@@ -329,36 +341,41 @@ async function findWasmUrl() {
 
   if (!page) return null;
 
-  const wasmUrlResult = await page.evaluate(async () => {
+  const wasmUrlResult = await page.evaluate(async function () {
+    const isWasmUrl = (url) => {
+      if (/cloudflare|turnstile/i.test(url)) return false;
+      return /\.wasm/i.test(url);
+    };
+
     try {
       // Method 1: Check performance API for .wasm resources
       const entries = performance.getEntriesByType("resource");
       for (const entry of entries) {
-        if (/\.wasm/i.test(entry.name)) return entry.name;
+        if (isWasmUrl(entry.name)) return entry.name;
       }
     } catch {}
 
     try {
-      // Method 1b: Extended — search all resources, including blob URLs and JS with wasm references
+      // Method 1b: Extended — search all resources for solve/pow/challenge + .wasm suffix
       const entries = performance.getEntriesByType("resource");
       for (const entry of entries) {
-        if (/solve|pow|challenge/i.test(entry.name)) return entry.name;
+        if (/solve|pow/i.test(entry.name) && isWasmUrl(entry.name)) return entry.name;
       }
     } catch {}
 
     try {
       // Method 2: Check all scripts for wasm-related names
       for (const script of document.querySelectorAll("script[src]")) {
-        const src = script.src.toLowerCase();
-        if (/wasm/.test(src) || /solve/i.test(src)) return script.src;
+        const src = script.src;
+        if ((/wasm/i.test(src) || /solve/i.test(src)) && isWasmUrl(src)) return src;
       }
     } catch {}
 
     try {
       // Method 3: Look for wasm URLs in global variables set by the app
       const win = window;
-      if (win.__DS_WASM_URL__) return win.__DS_WASM_URL__;
-      if (win.deepseekWasmUrl) return win.deepseekWasmUrl;
+      if (win.__DS_WASM_URL__ && isWasmUrl(win.__DS_WASM_URL__)) return win.__DS_WASM_URL__;
+      if (win.deepseekWasmUrl && isWasmUrl(win.deepseekWasmUrl)) return win.deepseekWasmUrl;
     } catch {}
 
     try {
@@ -393,9 +410,9 @@ async function findWasmUrl() {
       if (serverConfig) {
         const parsed = JSON.parse(serverConfig);
         const str = JSON.stringify(parsed);
-        // Look for wasm URLs in the config string
-        const match = str.match(/https?:\/\/[^"]*wasm[^"]*/i);
-        if (match) return match[0];
+        // Look for .wasm URLs in the config string
+        const matches = str.match(/https?:\/\/[^"]*\.wasm[^"]*/gi);
+        if (matches && isWasmUrl(matches[0])) return matches[0];
       }
     } catch {}
 
@@ -405,15 +422,15 @@ async function findWasmUrl() {
       if (featureStore) {
         const parsed = JSON.parse(featureStore);
         const str = JSON.stringify(parsed);
-        const match = str.match(/https?:\/\/[^"]*wasm[^"]*/i);
-        if (match) return match[0];
+        const matches = str.match(/https?:\/\/[^"]*\.wasm[^"]*/gi);
+        if (matches && isWasmUrl(matches[0])) return matches[0];
       }
     } catch {}
 
     // Debug: dump all resource names to help identify WASM location
     try {
       const entries = performance.getEntriesByType("resource");
-      const wasmCandidates = entries.filter((e) => /wasm|pow|solve|challenge/i.test(e.name));
+      const wasmCandidates = entries.filter((e) => isWasmUrl(e.name));
       if (wasmCandidates.length > 0 && wasmCandidates.length < 20) {
         // Return first non-filtered match as last resort
         return wasmCandidates[0]?.name;
@@ -467,6 +484,14 @@ export async function sendViaBrowser(messages, model, conversationHint) {
     // Find WASM URL inside the browser context (DeepSeek loads it dynamically on every visit)
     logInfo("[BrowserProxy] Поиск WASM модуля для PoW...");
     let wasmUrlResult = await findWasmUrl();
+
+    // Validate: must end with .wasm (not a JS wrapper like Cloudflare Turnstile)
+    if (!String(wasmUrlResult).endsWith(".wasm")) {
+      logWarn(
+        `[BrowserProxy] Найдено не WASM бинарное, а ${wasmUrlResult.split("/").pop().split("?")[0].slice(0, 30)} — пропуск PoW`
+      );
+      wasmUrlResult = null;
+    }
 
     let powResponseHeader = "";
     if (wasmUrlResult) {
